@@ -1,7 +1,9 @@
-# QAM-Seg quality-aware SSL plan
+# QAM-Seg quality-aware SSL
 
-Status: **plan only**. This slice does not train a semi-supervised model,
-does not download data, and does not change the supervised loss.
+Status: **MQE and QGC are implemented in code and covered by synthetic unit
+tests. They are not experimentally validated.** No ISIC, HAM10000, or PH2
+run is part of this change, and no Dice or HD95 number here is a result.
+This does not change the supervised loss used by `python train.py`.
 
 QAM-Seg (Quality-Aware Mamba Segmentation) keeps the released MambaLiteUNet
 code as a supervised backbone and adds a quality-aware semi-supervised
@@ -14,30 +16,41 @@ The supervised entry point remains:
 python train.py
 ```
 
-## Reserved CLI
+## CLI
 
-`train.py` accepts four flags and then **stops**, before the device is
-touched and before any epoch runs. Omitting them leaves the supervised path
-as it is.
+Omitting every flag leaves the supervised path as it is. `--ssl` is wired.
+The three ablation flags are still refused, before the device is touched
+and before any epoch runs.
 
-| Flag | Reserved meaning | Wired? |
+| Flag | Meaning | Wired? |
 | --- | --- | --- |
-| `--ssl` | Turn on the unlabeled branch below | No |
-| `--no-amf` | Ablation: bypass Adaptive Multi-branch Mamba Feature Fusion | No |
-| `--no-lgfm` | Ablation: bypass Local-Global Feature Mixing | No |
-| `--no-cga` | Ablation: bypass Cross-Gated Attention | No |
+| `--ssl` | MQE + QGC. Default process is a short CPU smoke on synthetic blobs | Yes (code, not a benchmark) |
+| `--no-amf` | Ablation: bypass Adaptive Multi-branch Mamba Feature Fusion | No, exit 2 |
+| `--no-lgfm` | Ablation: bypass Local-Global Feature Mixing | No, exit 2 |
+| `--no-cga` | Ablation: bypass Cross-Gated Attention | No, exit 2 |
 
 ```bash
+python train.py
 python train.py --ssl
-# exits with status 2 and points back at this document
+python -m qamseg.train_ssl
 ```
 
-`--help` also exits before training. Unknown arguments are ignored so a typo
+`python train.py --ssl` does not build MambaLiteUNet, does not read
+`isic_loader`, and does not download data. It runs `qamseg.train_ssl` with
+a tiny conv student so the loss, the gate, and the log line can execute
+without a GPU. `--ssl-steps` defaults to 2 for that reason. Passing
+`--no-amf`, `--no-lgfm`, or `--no-cga` with or without `--ssl` still exits
+2. Those bypasses are not wired; turning them on would change the
+supervised baseline without a matching forward.
+
+`--help` exits before training. Unknown arguments are ignored so a typo
 cannot silently select a different backbone.
 
-The ablation flags are documented here and refused in `train.py` on purpose.
-Wiring them halfway would change the supervised baseline without a matching
-experiment.
+Unit tests, from the repository root, with no GPU and no medical data:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Labeled path (already in the repo)
 
@@ -53,62 +66,101 @@ specificity, Dice (`f1_or_dsc`), and mIoU. HD95 is an extra log field in
 pixels at network resolution. It does not replace those metrics. See the
 README ERRATA before comparing any of this with the CVPR paper.
 
-## MQE — mask quality estimator (not implemented)
+## MQE — multi-cue quality estimator (implemented, not validated)
+
+Code: `qamseg/mqe.py`. Tests: `tests/test_mqe.py`.
 
 MQE scores a pseudo-mask. It is not a second segmentation architecture and
 it is not a claim about AMF.
 
-Planned signals, all computed from tensors the backbone already produces:
+Signals, computed from probability maps:
 
-1. **Predictive entropy** of the sigmoid mask, averaged over pixels.
-2. **View agreement**: Dice between the pseudo-mask under a weak view and a
-   strong view of the same unlabeled image. Low agreement means low quality.
-3. **Boundary uncertainty**: entropy restricted to a band around the 0.5
-   contour, so a confident interior cannot hide a noisy edge.
+1. **Predictive entropy** of the sigmoid mask (Bernoulli entropy / `ln 2`).
+2. **Teacher–student disagreement** on one view (`|p_teacher - p_student|`),
+   and **view agreement**: hard Dice between the weak-view pseudo-mask and
+   the strong-view pseudo-mask. Low agreement means low quality.
+3. **Boundary uncertainty**: mean entropy on a band around the 0.5 contour,
+   so a confident interior cannot hide a noisy edge. An empty band falls
+   back to the image mean and does not divide by zero.
 
 The estimator returns:
 
-- an image-level score in `[0, 1]`
-- an optional pixel-level weight map in `[0, 1]`
+- an image-level score `q` in `[0, 1]`
+- a pixel-level weight map in `[0, 1]`
 
-No learned MQE head is in this slice. The first implementation should be
-the three statistics above, logged on a labeled hold-out where a true mask
-exists, so the score can be compared with true Dice before it is trusted on
-unlabeled data.
+Default fusion is a weighted average of the active cues. `fusion="sigmoid"`
+applies the design form `σ(a · cues)`. Cue weights are placeholders.
+`QualityWeights.learned` defaults to 0.
 
-## QGC — quality-gated consistency (not implemented)
+`LearnedQualityHead` is a 1×1 stub. `--use-learned-quality-head` does not
+train it and does not turn on `L_Q` (`beta = 0`). Reliability targets
+`r = 1[correct] · (1 - H)` are available as a pure function for a later
+labeled-only fit. They are not computed from pseudo-labels.
 
-QGC uses MQE to decide whether an unlabeled pseudo-mask may supervise
-another view.
+Optional BAQ (`--ssl-baq`, off by default) down-weights pixels where the
+image gradient is high and quality is low. It is not a new backbone block.
 
-Planned step, for each unlabeled image:
+## QGC — quality-gated consistency (implemented, not validated)
 
-1. Teacher (or weak view) produces a pseudo-mask.
-2. MQE returns an image score `q` and an optional pixel map.
-3. **Gate.** If `q` is below a fixed threshold, drop the image for that
-   step. Otherwise weight the unsupervised loss by `q` (and by the pixel
-   map, if present).
-4. Student (or strong view) is trained with the same `BceDiceLoss` against
-   the gated pseudo-mask.
-5. Ramp the unsupervised coefficient from 0 to a cap over the first part of
-   training. The labeled `BceDiceLoss` stays at full weight the whole time.
+Code: `qamseg/qgc.py`, `qamseg/train_ssl.py`. Tests: `tests/test_qgc.py`,
+`tests/test_ssl_smoke.py`.
 
-Empty gates must be safe: a batch where every pseudo-mask is rejected adds
-no unsupervised term and does not divide by zero.
+For each unlabeled image:
+
+1. The EMA teacher sees a weak view and produces a pseudo-mask (stop-grad).
+2. MQE returns `q` and a pixel map. Disagreement uses the student on that
+   same weak view (also stop-grad). Dice uses the strong view.
+3. **Gate.** `hard` keeps a pixel or image only when its score is at least
+   `tau`. `soft` uses `score ** gamma`. `gated` (the default, and the step
+   in the plan) drops an image when `q < tau` and otherwise weights the
+   loss by `q ** gamma` and the pixel map.
+4. The student on the strong view is trained with weighted BCE + Dice
+   against the stopped teacher pseudo-label. The labeled term is
+   `BceDiceLoss` at full weight.
+5. `lambda_u(t) = lambda_max * exp(-5 (1 - t/T)^2)` and a linear `tau`
+   ramp are helpers. The numbers are placeholders, not a tuned schedule.
+
+Empty gates are safe: if every weight is zero, the unsupervised term is
+zero, stays on the student graph, and does not divide by the weight sum.
 
 This is consistency under a quality gate. It is not a reimplementation of
 AMF, LGFM, or CGA, and it does not retune those blocks.
 
-## What a later patch has to include
+The smoke augmentations are a horizontal flip (weak) and a vertical flip
+plus a corner cutout (strong). They are not the full weak/strong recipe.
+The EMA decay defaults to 0.99 and is a placeholder.
 
-- A dataloader that can yield labeled and unlabeled batches without
-  breaking `isic_loader` for `python train.py`.
-- MQE as a pure function with a unit test on synthetic masks.
-- QGC behind `--ssl`, default off.
-- Ablations `--no-amf`, `--no-lgfm`, `--no-cga` only once each bypass has a
-  defined forward and a parameter count from `scripts/count_params_flops.py`.
-- Logs that keep the current metrics and add the unlabeled loss, the
-  fraction of masks kept by the gate, and HD95.
+## Data
+
+`qamseg/data.py` builds a labeled loader and an unlabeled loader.
+`loader.isic_loader` is unchanged and is not imported by that module.
+The default datasets are synthetic blobs. A local `.npy` may be passed
+with `--ssl-unlabeled-npy` or `--ssl-labeled-npy` plus `--ssl-mask-npy`.
+A missing file raises `FileNotFoundError`. Nothing in this path downloads
+ISIC, HAM10000, or PH2.
+
+Real unlabeled pools — the remainder of a train split, masks withheld,
+test images never used as unlabeled — are still a TODO in
+`qamseg/data.py`.
+
+## Logs
+
+Each SSL step prints supervised loss, unlabeled loss (`unsup`), `lambda_u`,
+`gate_keep_fraction`, and mean `q`. After the steps, a labeled eval prints
+loss, mIoU, Dice (`f1_or_dsc`), accuracy, specificity, sensitivity, and
+`hd95`. Those names match `engine.py`. HD95 still uses `utils.summarize_hd95`.
+On the smoke path the numbers describe synthetic blobs. They are not
+dataset scores and they do not replace the supervised log.
+
+## What is still open
+
+- Train MQE/QGC on a real labeled fraction with MambaLiteUNet as the
+  student and teacher. This entry point does not construct that backbone.
+- Prepare unlabeled splits. Do not use test images as unlabeled data.
+- Wire `--no-amf`, `--no-lgfm`, and `--no-cga` only together with a defined
+  forward and a parameter count from `scripts/count_params_flops.py`.
+- Region-level gating, a trained reliability head, and the full augmentation
+  list.
 - No table that presents upstream CVPR numbers as QAM-Seg scores.
 
 ## Explicit non-goals of this document

@@ -1,13 +1,17 @@
 import sys
 
-# Refuse reserved QAM-Seg flags before importing the training stack.
+# Parse QAM-Seg flags before importing the supervised training stack.
 # `python train.py` with no extra flags is unchanged.
+# `--ssl` dispatches to the SSL path and returns. Ablation flags still exit 2.
 if __name__ == '__main__':
     from qamseg.cli import parse_train_args, refuse_reserved_flags
     _args, _unknown, _reserved = parse_train_args(sys.argv[1:])
+    refuse_reserved_flags(_reserved)
+    if _args.ssl:
+        from qamseg.train_ssl import main as ssl_main
+        raise SystemExit(ssl_main(sys.argv[1:]))
     if _unknown:
         print('QAM-Seg: ignoring unrecognized arguments: ' + ' '.join(_unknown))
-    refuse_reserved_flags(_reserved)
 
 import torch
 from torch import nn

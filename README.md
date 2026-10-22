@@ -6,8 +6,9 @@ QAM-Seg (Quality-Aware Mamba Segmentation) is a PhD project that keeps a
 supervised Mamba segmentation network as its backbone and adds a
 quality-aware semi-supervised objective (mask quality estimation and
 quality-gated consistency). This repository is a fork of MambaLiteUNet.
-The SSL objective is specified in [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md)
-and is **not trained** here.
+MQE and QGC are implemented under `qamseg/` and specified in
+[docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md). They are **not experimentally
+validated**. No ISIC, HAM10000, or PH2 result is reported here.
 
 This fork does not claim coauthorship of the upstream modules AMF, LGFM, or
 CGA, and it does not claim the CVPR 2026 MambaLiteUNet metrics.
@@ -42,10 +43,12 @@ and [LICENSE](LICENSE).
   ships no license.
 - This README, rebranded for QAM-Seg. The GitHub "About" description is not
   changed from here.
-- [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md): plan for MQE and QGC.
-- Reserved CLI flags `--ssl`, `--no-amf`, `--no-lgfm`, `--no-cga`. Passing
-  one of them makes `train.py` exit before training. Leaving them off keeps
-  the supervised entry point.
+- [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md): MQE and QGC. Implemented in
+  code, unit-tested on synthetic tensors, not experimentally validated.
+- `--ssl` runs that path (`python train.py --ssl` or
+  `python -m qamseg.train_ssl`). The default is a short CPU smoke on
+  synthetic blobs with a tiny student, not MambaLiteUNet and not a
+  benchmark. `--no-amf`, `--no-lgfm`, and `--no-cga` are still refused.
 - [scripts/count_params_flops.py](scripts/count_params_flops.py): parameter
   count, and FLOPs when `thop` or `fvcore` can run a forward, at 256×256.
 - HD95 (pixels) on the existing validation and test logs, without replacing
@@ -174,9 +177,9 @@ the upstream `requirements.txt`.
    python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
    ```
 
-`train.py` and `test.py` call `.cuda()` and `torch.cuda.empty_cache()`.
-They are the upstream GPU training path. This fork does not add a CPU
-training loop.
+`train.py` (with no flags) and `test.py` call `.cuda()` and
+`torch.cuda.empty_cache()`. They are the upstream GPU training path.
+`--ssl` is a separate CPU smoke loop and does not replace that path.
 
 ## 2. Dataset preparation
 
@@ -237,16 +240,16 @@ python train.py
 - Default optimizer, loss, input size (256×256), and `c_list` are in
   `configs/config_setting.py`.
 
-Reserved flags, all refused with exit code 2 before the model is built:
+Ablation flags are refused with exit code 2 before the model is built:
 
 ```bash
-python train.py --ssl
 python train.py --no-amf
 python train.py --no-lgfm
 python train.py --no-cga
 ```
 
 `python train.py --help` prints the flag text and does not train.
+`python train.py --ssl` does not enter the supervised loop; see section 4.
 
 ### 3.2 Test
 
@@ -317,8 +320,23 @@ pip install fvcore
 
 ## 4. Quality-aware SSL
 
-See [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md) for the MQE and QGC plan.
-Nothing in that plan runs when you execute `python train.py`.
+MQE (`qamseg/mqe.py`) and QGC (`qamseg/qgc.py`) are implemented.
+`python train.py` with no flags does not run them. `python train.py --ssl`
+and `python -m qamseg.train_ssl` do. The default student is a tiny
+convolution, the default images are synthetic blobs, and the default length
+is two optimizer steps on CPU. That checks the wiring. It is not a
+training result, and it does not claim a Dice or HD95 score.
+
+```bash
+python train.py --ssl
+python -m unittest discover -s tests -v
+```
+
+The step log adds unlabeled loss and `gate_keep_fraction`. The eval log
+keeps loss, mIoU, Dice (`f1_or_dsc`), accuracy, specificity, sensitivity,
+and HD95. Ablations `--no-amf`, `--no-lgfm`, and `--no-cga` still exit 2.
+AMF, LGFM, and CGA are unchanged upstream modules. Details and the
+unlabeled-data TODO are in [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md).
 
 ## 5. Citation
 

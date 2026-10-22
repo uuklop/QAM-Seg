@@ -74,6 +74,25 @@ def build_parser():
     )
     parser.add_argument('--ssl-mask-npy', default='', help='Mask .npy paired with --ssl-labeled-npy.')
     parser.add_argument(
+        '--ssl-split',
+        default='',
+        help=(
+            'Fraction JSON from scripts/make_labeled_fraction_splits.py '
+            '(fraction_5.json, fraction_10.json, or fraction_20.json). '
+            'Requires local train .npy paths. Missing files error. No download.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-backbone',
+        default='tiny',
+        choices=('tiny', 'mamba'),
+        help=(
+            'SSL student. tiny (default) is the CPU conv stand-in. '
+            'mamba imports models.MambaLiteUNet and exits non-zero if that import fails. '
+            'Ignored unless --ssl is set. Not a CVPR run.'
+        ),
+    )
+    parser.add_argument(
         '--use-learned-quality-head',
         action='store_true',
         help='Acknowledge the MQE head stub. It is not trained and its fusion weight stays 0.',

@@ -47,8 +47,14 @@ and [LICENSE](LICENSE).
   code, unit-tested on synthetic tensors, not experimentally validated.
 - `--ssl` runs that path (`python train.py --ssl` or
   `python -m qamseg.train_ssl`). The default is a short CPU smoke on
-  synthetic blobs with a tiny student, not MambaLiteUNet and not a
-  benchmark. `--no-amf`, `--no-lgfm`, and `--no-cga` are still refused.
+  synthetic blobs with a tiny student. `--ssl-backbone mamba` uses
+  `MambaLiteUNet` only when that import works; a failed import exits
+  non-zero instead of falling back. `--no-amf`, `--no-lgfm`, and
+  `--no-cga` are still refused.
+- `scripts/make_labeled_fraction_splits.py` writes deterministic 5%/10%/20%
+  labeled subsets and complementary unlabeled pools for a local train id
+  list or `data_train.npy`. It does not download data. See
+  [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md).
 - [scripts/count_params_flops.py](scripts/count_params_flops.py): parameter
   count, and FLOPs when `thop` or `fvcore` can run a forward, at 256×256.
 - HD95 (pixels) on the existing validation and test logs, without replacing
@@ -329,14 +335,21 @@ training result, and it does not claim a Dice or HD95 score.
 
 ```bash
 python train.py --ssl
+python scripts/make_labeled_fraction_splits.py --help
 python -m unittest discover -s tests -v
 ```
 
-The step log adds unlabeled loss and `gate_keep_fraction`. The eval log
-keeps loss, mIoU, Dice (`f1_or_dsc`), accuracy, specificity, sensitivity,
-and HD95. Ablations `--no-amf`, `--no-lgfm`, and `--no-cga` still exit 2.
-AMF, LGFM, and CGA are unchanged upstream modules. Details and the
-unlabeled-data TODO are in [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md).
+`--ssl-backbone` defaults to `tiny`. `--ssl-backbone mamba` imports
+`models.MambaLiteUNet` and exits non-zero if the import fails. The split
+script writes `splits/<name>/seed<seed>/fraction_{5,10,20}.json` plus CSV
+id lists. Pointing `python train.py --ssl --ssl-split ...` at those files
+requires local train arrays; a missing path exits with an error and does
+not download ISIC, HAM10000, or PH2. The step log adds unlabeled loss and
+`gate_keep_fraction`. The eval log keeps loss, mIoU, Dice (`f1_or_dsc`),
+accuracy, specificity, sensitivity, and HD95. Those numbers are wiring
+checks, not dataset scores. Ablations `--no-amf`, `--no-lgfm`, and
+`--no-cga` still exit 2. AMF, LGFM, and CGA are unchanged upstream
+modules. Details are in [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md).
 
 ## 5. Citation
 

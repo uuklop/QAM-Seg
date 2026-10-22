@@ -10,6 +10,8 @@ if __name__ == '__main__':
     if _args.ssl:
         from qamseg.train_ssl import main as ssl_main
         raise SystemExit(ssl_main(sys.argv[1:]))
+    if _args.ssl_backbone != 'tiny':
+        print('QAM-Seg: ignoring --ssl-backbone because --ssl was not set. Supervised training is unchanged.')
     if _unknown:
         print('QAM-Seg: ignoring unrecognized arguments: ' + ' '.join(_unknown))
 

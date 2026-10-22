@@ -3,11 +3,11 @@
 ``loader.isic_loader`` is not modified and is not imported here. Supervised
 ``python train.py`` keeps using that class alone.
 
-Real unlabeled pools (the rest of a train split, masks withheld, test
-images never included) are not prepared in this repository. This module
-does not download ISIC, HAM10000, or PH2. The smoke path uses synthetic
-blobs. A local ``.npy`` can be passed in; a missing path raises
-``FileNotFoundError`` with that TODO instead of fetching data.
+The smoke path uses synthetic blobs. A local train ``.npy`` pair can be
+sliced with a fraction JSON from ``qamseg.splits`` (labeled rows keep masks,
+unlabeled rows do not). A missing path raises ``FileNotFoundError``. This
+module does not download ISIC, HAM10000, or PH2, and it does not treat
+``data_val.npy`` or ``data_test.npy`` as an unlabeled pool.
 """
 
 from __future__ import annotations
@@ -23,9 +23,14 @@ from torch.utils.data import DataLoader, Dataset
 
 
 UNLABELED_TODO = (
-    "TODO: point this at a locally prepared unlabeled array "
-    "(remaining train images, no masks, test images excluded). "
+    "Point --ssl-split at a fraction JSON from scripts/make_labeled_fraction_splits.py "
+    "and pass local train .npy files, or pass a local unlabeled .npy. "
+    "Remaining train images only; do not use validation or test images. "
     "This code does not download ISIC, HAM10000, or PH2."
+)
+
+_HELD_OUT_ARRAY_NAMES = frozenset(
+    {"data_test.npy", "data_val.npy", "mask_test.npy", "mask_val.npy"}
 )
 
 
@@ -118,12 +123,24 @@ def _to_nchw(array: np.ndarray) -> Tensor:
     return tensor.clamp(0.0, 1.0)
 
 
+def _refuse_heldout_array(path: str) -> None:
+    name = os.path.basename(path).lower() if path else ""
+    if name in _HELD_OUT_ARRAY_NAMES:
+        raise ValueError(
+            f"Refusing to build an SSL pool from {path}. "
+            "Validation and test arrays must not be used as labeled or unlabeled data. "
+            "Point --ssl-labeled-npy at data_train.npy and --ssl-mask-npy at mask_train.npy. "
+            + UNLABELED_TODO
+        )
+
+
 def load_unlabeled_array(path: str) -> Tensor:
     """Load a local unlabeled image array.
 
     Accepts ``(N, H, W, C)`` or ``(N, C, H, W)``. Missing files raise
     ``FileNotFoundError`` and do not trigger a download.
     """
+    _refuse_heldout_array(path)
     if not path or not os.path.isfile(path):
         raise FileNotFoundError(f"Unlabeled array not found: {path}. {UNLABELED_TODO}")
     array = np.load(path)
@@ -134,7 +151,9 @@ def load_unlabeled_array(path: str) -> Tensor:
 
 
 def load_labeled_arrays(image_path: str, mask_path: str) -> tuple[Tensor, Tensor]:
-    """Load a local labeled pair. Same TODO as the unlabeled path: no download."""
+    """Load a local labeled pair. Same message as the unlabeled path: no download."""
+    _refuse_heldout_array(image_path)
+    _refuse_heldout_array(mask_path)
     if not os.path.isfile(image_path) or not os.path.isfile(mask_path):
         missing = image_path if not os.path.isfile(image_path) else mask_path
         raise FileNotFoundError(f"Labeled array not found: {missing}. {UNLABELED_TODO}")
@@ -158,6 +177,32 @@ def load_labeled_arrays(image_path: str, mask_path: str) -> tuple[Tensor, Tensor
     return images, masks
 
 
+def datasets_from_split(image_path: str, mask_path: str, split_path: str) -> tuple[Dataset, Dataset]:
+    """Slice a local train pair with a ``fraction_*.json`` file.
+
+    Unlabeled rows are returned as images only. The split must be a partition
+    of this train array. Missing files raise ``FileNotFoundError``.
+    """
+    from qamseg.splits import load_fraction_record, rows_cover_train
+
+    _refuse_heldout_array(image_path)
+    _refuse_heldout_array(mask_path)
+    record = load_fraction_record(split_path)
+    images, masks = load_labeled_arrays(image_path, mask_path)
+    labeled_rows, unlabeled_rows = rows_cover_train(record, int(images.shape[0]))
+    if not labeled_rows:
+        raise ValueError(f"Split {split_path} has no labeled rows.")
+    if not unlabeled_rows:
+        raise ValueError(
+            f"Split {split_path} has an empty unlabeled pool. "
+            "The complement of the labeled subset is empty, so there is nothing to train on. "
+            + UNLABELED_TODO
+        )
+    labeled = ArrayImageDataset(images[labeled_rows], masks[labeled_rows])
+    unlabeled = ArrayImageDataset(images[unlabeled_rows], masks=None)
+    return labeled, unlabeled
+
+
 def build_ssl_datasets(
     length: int = 4,
     size: int = 32,
@@ -165,13 +210,28 @@ def build_ssl_datasets(
     unlabeled_npy: str = "",
     labeled_npy: str = "",
     mask_npy: str = "",
+    split_json: str = "",
 ) -> tuple[Dataset, Dataset]:
     """Synthetic datasets by default.
 
-    A non-empty ``unlabeled_npy`` replaces the unlabeled half. Labeled
-    ``.npy`` paths are used only when both the image array and the mask
-    array are provided. ``isic_loader`` is never constructed here.
+    A non-empty ``split_json`` slices ``labeled_npy`` / ``mask_npy`` into a
+    labeled subset and an unlabeled complement. A non-empty ``unlabeled_npy``
+    replaces the unlabeled half when no split is passed. Labeled ``.npy``
+    paths are used only when both the image array and the mask array are
+    provided. ``isic_loader`` is never constructed here.
     """
+    if split_json:
+        if unlabeled_npy:
+            raise ValueError(
+                "--ssl-split selects the unlabeled pool from the train arrays "
+                "(masks withheld). Do not also pass --ssl-unlabeled-npy."
+            )
+        if not labeled_npy or not mask_npy:
+            raise ValueError(
+                "Pass --ssl-labeled-npy and --ssl-mask-npy with --ssl-split. "
+                "Missing paths are an error. " + UNLABELED_TODO
+            )
+        return datasets_from_split(labeled_npy, mask_npy, split_json)
     if labeled_npy or mask_npy:
         if not labeled_npy or not mask_npy:
             raise ValueError("Pass both --ssl-labeled-npy and --ssl-mask-npy, or neither.")

@@ -7,8 +7,11 @@ synthetic blobs with a tiny conv student, so it does not need a GPU,
 experiment and it does not report a Dice or HD95 result.
 
 The step itself takes any student that maps ``(B, 3, H, W)`` to a sigmoid
-mask ``(B, 1, H, W)``. Swapping in MambaLiteUNet belongs to a later run
-that has the backbone dependencies and a prepared split.
+mask ``(B, 1, H, W)``. ``--ssl-backbone mamba`` builds
+``models.MambaLiteUNet`` when that import works. The default remains
+``TinySegStudent``. A prepared split is optional and only indexes local
+arrays; this module still does not download medical data or report a
+dataset Dice or HD95.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import torch
 from torch import nn
 
 from qamseg.augment import strong_augment, weak_augment
+from qamseg.backbones import BackboneUnavailable, build_mamba_student
 from qamseg.cli import parse_train_args, refuse_reserved_flags
 from qamseg.data import build_dual_loaders, build_ssl_datasets, iter_dual_batches
 from qamseg.ema import ema_update
@@ -217,28 +221,47 @@ def run_from_args(args) -> int:
         print("The synthetic smoke path runs on CPU. Re-run with --ssl-device cpu.")
         return 2
 
-    synthetic = not (args.ssl_unlabeled_npy or args.ssl_labeled_npy or args.ssl_mask_npy)
+    synthetic = not (args.ssl_unlabeled_npy or args.ssl_labeled_npy or args.ssl_mask_npy or args.ssl_split)
     print("QAM-Seg SSL path: MQE + QGC.")
     print("Implemented in code and exercised on this process only.")
     print("Not experimentally validated. No ISIC, HAM10000, or PH2 download.")
     print("No CVPR MambaLiteUNet metric is computed or claimed.")
     if args.use_learned_quality_head:
         print("Learned MQE head flag is set, but the head stays a stub (weight a3 = 0, beta = 0).")
-    if synthetic:
-        print("Data: synthetic blobs. Student: TinySegStudent, not MambaLiteUNet.")
+    backbone = str(args.ssl_backbone)
+    if backbone == "mamba":
+        try:
+            student = build_mamba_student()
+        except BackboneUnavailable as exc:
+            print(exc)
+            return 2
+        print("Student: MambaLiteUNet. Import succeeded.")
+        print("This is not a CVPR reproduction. Logs from this process are not medical Dice or HD95 results.")
     else:
-        print("Data: local npy arrays passed on the CLI. Student: TinySegStudent.")
-        print("A MambaLiteUNet student is not built by this entry point.")
+        student = TinySegStudent()
+        print("Student: TinySegStudent.")
+    if synthetic:
+        print("Data: synthetic blobs.")
+    elif args.ssl_split:
+        print("Data: local train arrays sliced by --ssl-split. Unlabeled rows do not keep masks.")
+        print("Validation and test images are not added. Eval on the labeled subset is a wiring check, not a test score.")
+    else:
+        print("Data: local npy arrays passed on the CLI.")
 
     length = max(int(args.ssl_batch_size) * 2, int(args.ssl_batch_size))
-    labeled, unlabeled = build_ssl_datasets(
-        length=length,
-        size=int(args.ssl_image_size),
-        seed=int(args.ssl_seed),
-        unlabeled_npy=args.ssl_unlabeled_npy,
-        labeled_npy=args.ssl_labeled_npy,
-        mask_npy=args.ssl_mask_npy,
-    )
+    try:
+        labeled, unlabeled = build_ssl_datasets(
+            length=length,
+            size=int(args.ssl_image_size),
+            seed=int(args.ssl_seed),
+            unlabeled_npy=args.ssl_unlabeled_npy,
+            labeled_npy=args.ssl_labeled_npy,
+            mask_npy=args.ssl_mask_npy,
+            split_json=args.ssl_split,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"QAM-Seg: {exc}")
+        return 2
     labeled_loader, unlabeled_loader = build_dual_loaders(
         labeled,
         unlabeled,
@@ -250,21 +273,25 @@ def run_from_args(args) -> int:
         print("Lower --ssl-batch-size, or pass a local array with at least one full batch.")
         print("This entry point does not download ISIC, HAM10000, or PH2.")
         return 2
-    val_labeled, _val_unlabeled = build_ssl_datasets(
-        length=length,
-        size=int(args.ssl_image_size),
-        seed=int(args.ssl_seed) + 17,
-        unlabeled_npy="",
-        labeled_npy=args.ssl_labeled_npy,
-        mask_npy=args.ssl_mask_npy,
-    )
+    try:
+        val_labeled, _val_unlabeled = build_ssl_datasets(
+            length=length,
+            size=int(args.ssl_image_size),
+            seed=int(args.ssl_seed) + 17,
+            unlabeled_npy="",
+            labeled_npy=args.ssl_labeled_npy,
+            mask_npy=args.ssl_mask_npy,
+            split_json=args.ssl_split,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"QAM-Seg: {exc}")
+        return 2
     val_loader, _ = build_dual_loaders(
         val_labeled,
         val_labeled,
         batch_size=int(args.ssl_batch_size),
         shuffle=False,
     )
-    student = TinySegStudent()
     if device == "cuda":
         student = student.cuda()
         # Loaders yield CPU tensors. Move them inside the loop only if asked.

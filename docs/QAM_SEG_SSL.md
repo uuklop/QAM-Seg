@@ -25,9 +25,16 @@ and before any epoch runs.
 | Flag | Meaning | Wired? |
 | --- | --- | --- |
 | `--ssl` | MQE + QGC. Default process is a short CPU smoke on synthetic blobs | Yes (code, not a benchmark) |
-| `--ssl-backbone tiny` | Default CPU conv student. Does not import `mamba_ssm` | Yes |
+| `--ssl-backbone tiny` | `TinySegStudent`, the CPU convolutional fallback. Does not import `mamba_ssm`. There is no separate ConvLiteUNet class | Yes |
 | `--ssl-backbone mamba` | SSL student is `models.MambaLiteUNet` when that import works. A failed import exits non-zero and does not fall back, because the backbone was requested | Yes, optional |
 | `--ssl-split PATH` | Slice a local train `.npy` pair with `fraction_5.json`, `fraction_10.json`, or `fraction_20.json` | Yes, local files only |
+| `--ssl-gate ungated` | Uniform consistency weights. With reweight off, this is plain mean teacher | Yes |
+| `--quality-reweight {off,sample,pixel}` | MQE reweight of the unlabeled term. `off` (default) keeps the previous QGC loss | Yes |
+| `--ssl-lambda-qw` | Coefficient on that reweighted term. Default `1`. QG-SSL used `0.25`. Ignored when reweight is off | Yes |
+| `--ssl-qw-ramp {gaussian,linear,none}` | Mix from uniform weights to the MQE score. Default `gaussian` | Yes |
+| `--ssl-method {qam,mt,uamt,pl,supervised}` | `qam` honors the flags above. The other four force a shared-student baseline | Yes |
+| `--ssl-out-dir` | Write `metrics.json` for the aggregation script | Yes |
+| `--ssl-eval-npy` / `--ssl-eval-mask-npy` | Held-out eval only. Val/test names are allowed here and still refused as training pools | Yes |
 | `--no-amf` | Ablation: bypass Adaptive Multi-branch Mamba Feature Fusion | No, exit 2 |
 | `--no-lgfm` | Ablation: bypass Local-Global Feature Mixing | No, exit 2 |
 | `--no-cga` | Ablation: bypass Cross-Gated Attention | No, exit 2 |
@@ -137,6 +144,112 @@ zero, stays on the student graph, and does not divide by the weight sum.
 This is consistency under a quality gate. It is not a reimplementation of
 AMF, LGFM, or CGA, and it does not retune those blocks.
 
+## MQE reweight (PL-QW analogue)
+
+Code: `qamseg/reweight.py`. Tests: `tests/test_reweight.py`.
+
+QG-SSL weights a pseudolabel loss by a frozen external network,
+`w_j = g_φ(x, ŷ)`. QAM-Seg uses the same weighting pattern with the
+score QGC already computed. No third network is constructed.
+
+```text
+α(t) = exp(-5 (1 - t/T)^2)          # --ssl-qw-ramp gaussian; T = steps-1
+w_j(t) = (1 - α(t)) + α(t) * q_j     # sample mode; q_j is detached MQE
+L = L_sup + λ_u(t) * λ_qw * mean_j(w_j(t) * ℓ_j)
+```
+
+`pixel` mode uses the MQE pixel map in place of `q_j`. `--quality-reweight off`
+does not take this path: the unlabeled term is the previous QGC loss,
+including its weight normalization. `--ssl-lambda-qw` defaults to 1 so
+an ablation compares weights rather than a second scale. Pass `0.25` to
+use the coefficient published with QG-SSL.
+
+When reweighting is on, a `hard` or `gated` gate contributes only the
+binary keep (`q >= tau`). It does not multiply by `q` a second time.
+BAQ still edits the pixel map before that keep. `soft` does stack with
+the reweight; the MedIA recipes do not use that combination.
+
+`qam-qw` in the protocol runner is ungated sample reweight: the direct
+analogue. `qam-gated-baq-qw` is the requested stacked ablation
+(gate + BAQ + sample reweight).
+
+## Quality-aware regularization
+
+Not implemented. QG-SSL's QAR backpropagates `1 - g_φ(x, f_θ(x))` through
+a frozen quality network. MQE has no such network. Differentiating the
+existing cues would minimize entropy and repeat the consistency loss,
+which is the UA-MT baseline and QGC, and it would push contours to be
+confident where BAQ is trying to be careful. `qamseg/qar.py` records that
+skip and raises if called. There is no `--ssl-qar` flag.
+
+## Baselines on the same student
+
+`--ssl-method` selects a preset. `qam` is the only mode that keeps
+`--ssl-gate`, `--ssl-baq`, and `--quality-reweight`.
+
+| Method | Unlabeled term |
+| --- | --- |
+| `mt` | EMA teacher, ungated consistency. MQE is logged and not used in the loss |
+| `uamt` | Same, with teacher predictive entropy as the weight. Pixels above `--ssl-uncertainty-tau` (default 0.75) are dropped. This is not Monte Carlo dropout inside MambaLiteUNet |
+| `pl` | Hard pseudo-labels where `max(p, 1-p)` is at least `--ssl-pl-threshold` (default 0.95 when the preset is selected) |
+| `supervised` | `λ_u = 0`. Unlabeled images are not used in the loss |
+
+UA-MT and PL are the fair confidence baselines. They do not call MQE for weights.
+
+## MedIA protocol
+
+`scripts/run_media_protocol.py` lists seeds 0, 1, and 2, labeled fractions
+5/10/20, and a supervised full job. Recipes: `supervised`, `mt`, `uamt`,
+`pl`, `qam-ungated`, `qam-gated`, `qam-gated-baq`, `qam-gated-baq-qw`,
+and `qam-qw`. `qam-qw-pixel` is registered and off by default.
+
+```bash
+python scripts/run_media_protocol.py --dry-run --out-dir results/media_protocol
+python scripts/run_media_protocol.py --smoke --recipes qam-qw,mt --seeds 0 --fractions 10
+```
+
+A real run refuses to start without `--train-npy`, `--mask-npy`, and
+`--steps`. It writes splits with the existing fraction tool and does not
+download data. `--backbone mamba` is the student for that run. The default
+`--backbone tiny` stays the CPU fallback.
+
+`scripts/aggregate_media_results.py` reads each `metrics.json` and writes
+`summary.csv` and `summary.md` with mean ± sample std (ddof=1) for Dice,
+mIoU, HD95, and ASSD. One seed leaves the std blank. Synthetic rows are
+not medical scores. HD95 and ASSD are pixels, not millimetres.
+
+Pass `--ssl-eval-npy` (or the runner's `--eval-npy`) with a local
+`data_val.npy` / `data_test.npy` when those arrays exist. Until then the
+eval split recorded in `metrics.json` is the labeled train subset.
+
+## Related work
+
+**MambaLiteUNet** (Rahman, Jung, and Hammond, CVPR 2026) is the supervised
+backbone this fork trains. AMF, LGFM, and CGA are upstream modules.
+QAM-Seg does not claim that paper's Dice or parameter table.
+
+**QG-SSL** (Abhishek and Hamarneh, MICCAI 2026, arXiv:2606.01753) is the
+closest quality-aware SSL method. It trains a separate predictor `g_φ` on
+variable-quality masks, then freezes it. QAR pushes the segmentor to raise
+`g_φ(x, f_θ(x))`. PL-QW reweights pseudolabel losses by `g_φ(x, ŷ)` with
+`λ_qw = 0.25`. The predictor is a second phase and a second network, and
+the paper applies it on top of MT, UA-MT, ICT, PL-T, and PL-C.
+
+QAM-Seg does not add `g_φ`. The quality score is computed inside the
+mean-teacher step from entropy, disagreement, cross-view agreement, and
+boundary-band entropy (MQE), then used to gate consistency (QGC),
+optionally to edit pixel weights at strong image gradients (BAQ), and,
+when `--quality-reweight` is on, to reweight the unlabeled term the way
+PL-QW reweights with `g_φ`. QAR is omitted for the reason above.
+
+Uncertainty-weighted consistency (UA-MT) and confidence-threshold
+pseudo-labels are baselines in the protocol, not part of the QAM-Seg
+objective. They use the teacher's own confidence. MQE does not.
+
+The checklists for a Medical Image Analysis submission, including the
+runs that still need local data, are in
+[MEDIA_NOTES.md](MEDIA_NOTES.md).
+
 The smoke augmentations are a horizontal flip (weak) and a vertical flip
 plus a corner cutout (strong). They are not the full weak/strong recipe.
 The EMA decay defaults to 0.99 and is a placeholder.
@@ -244,18 +357,21 @@ build the SSL student.
 ## Logs
 
 Each SSL step prints supervised loss, unlabeled loss (`unsup`), `lambda_u`,
-`gate_keep_fraction`, and mean `q`. After the steps, a labeled eval prints
-loss, mIoU, Dice (`f1_or_dsc`), accuracy, specificity, sensitivity, and
-`hd95`. Those names match `engine.py`. HD95 still uses `utils.summarize_hd95`.
+`gate_keep_fraction`, mean `q`, `reweight`, and `qw_alpha`. `qw_alpha` is
+0 when `--quality-reweight` is off. After the steps, a labeled eval prints
+loss, mIoU, Dice (`f1_or_dsc`), accuracy, specificity, sensitivity,
+`hd95`, and `assd`. Those names match `engine.py`. HD95 and ASSD use
+`utils.summarize_hd95` and `utils.summarize_assd`.
 On the smoke path the numbers describe synthetic blobs. They are not
 dataset scores and they do not replace the supervised log.
 
 ## What is still open
 
-- Run MQE/QGC on a prepared labeled fraction with the optional Mamba
-  student. The hook can construct `MambaLiteUNet` after a successful
-  import. This repository still does not run that training, and it still
-  does not publish a medical Dice or HD95.
+- Run the MedIA protocol on a prepared labeled fraction with
+  `--backbone mamba`, three seeds, and a held-out `--eval-npy`. This
+  repository still does not run that training, and it still does not
+  publish a medical Dice, mIoU, HD95, or ASSD. See
+  [MEDIA_NOTES.md](MEDIA_NOTES.md).
 - HAM10000 and PH2 still have no prepare script in this tree. Do not use
   test images as unlabeled data.
 - Wire `--no-amf`, `--no-lgfm`, and `--no-cga` only together with a defined

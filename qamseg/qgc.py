@@ -36,7 +36,7 @@ class GateConfig:
     hard_targets: bool = True
 
     def __post_init__(self):
-        if self.mode not in ("hard", "soft", "gated"):
+        if self.mode not in ("hard", "soft", "gated", "ungated"):
             raise ValueError(f"Unknown gate mode: {self.mode}")
         if self.level not in ("image", "pixel", "both"):
             raise ValueError(f"Unknown gate level: {self.level}")
@@ -52,6 +52,8 @@ class GateResult:
     keep_fraction: Tensor
     mean_weight: Tensor
     weights: Tensor
+    qw_alpha: float = 0.0
+    sample_weight: Optional[Tensor] = None
 
 
 def tau_at_step(step: int, tau0: float, tau1: float, warm_steps: int) -> float:
@@ -99,6 +101,9 @@ def gate_weights(quality: QualityEstimate, config: GateConfig) -> Tensor:
             f"Gate batch mismatch: q {tuple(q.shape)} vs pixels {tuple(pixel.shape)}"
         )
     q = q.to(device=pixel.device)
+
+    if config.mode == "ungated":
+        return torch.ones_like(pixel)
 
     use_image = config.level in ("image", "both")
     use_pixel = config.level in ("pixel", "both")

@@ -54,7 +54,15 @@ def build_parser():
     parser.add_argument('--ssl-device', default='cpu', choices=('cpu', 'cuda'))
     parser.add_argument('--ssl-batch-size', type=int, default=2)
     parser.add_argument('--ssl-image-size', type=int, default=32)
-    parser.add_argument('--ssl-gate', default='gated', choices=('hard', 'soft', 'gated'))
+    parser.add_argument(
+        '--ssl-gate',
+        default='gated',
+        choices=('hard', 'soft', 'gated', 'ungated'),
+        help=(
+            'QGC mode. ungated is uniform consistency (plain mean teacher when '
+            'quality reweight is also off). Default gated keeps the previous objective.'
+        ),
+    )
     parser.add_argument('--ssl-level', default='both', choices=('image', 'pixel', 'both'))
     parser.add_argument('--ssl-tau0', type=float, default=0.4)
     parser.add_argument('--ssl-tau1', type=float, default=0.8)
@@ -102,6 +110,96 @@ def build_parser():
         action='store_true',
         help='Multiply pixel weights by the optional boundary-aware prior. Off by default.',
     )
+    parser.add_argument(
+        '--quality-reweight',
+        default='off',
+        choices=('off', 'sample', 'pixel'),
+        help=(
+            'MQE reweight of the unlabeled term (QG-SSL PL-QW analogue, no g_phi). '
+            'off (default) keeps QGC. sample weights each image by the ramped MQE score. '
+            'pixel weights each pixel by the ramped MQE map. See docs/QAM_SEG_SSL.md.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-lambda-qw',
+        type=float,
+        default=1.0,
+        help=(
+            'Coefficient on the reweighted unlabeled term. Ignored when --quality-reweight off. '
+            'Default 1 keeps the unlabeled scale aligned with --ssl-lambda-max. '
+            'QG-SSL used 0.25; pass 0.25 to match that coefficient.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-qw-ramp',
+        default='gaussian',
+        choices=('gaussian', 'linear', 'none'),
+        help=(
+            'Ramp of the MQE weight from uniform (step 0) to the quality score (last step). '
+            'gaussian matches the lambda_u shape. none uses the quality score immediately.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-method',
+        default='qam',
+        choices=('qam', 'mt', 'uamt', 'pl', 'supervised'),
+        help=(
+            'Recipe preset. qam (default) honors the gate, BAQ, and reweight flags. '
+            'mt, uamt, pl, and supervised replace those with a fair baseline on the same student. '
+            'uamt uses teacher entropy, not dropout inside MambaLiteUNet.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-uncertainty',
+        default='off',
+        choices=('off', 'entropy'),
+        help='UA-MT weight from teacher predictive entropy. Off unless --ssl-method uamt sets it.',
+    )
+    parser.add_argument(
+        '--ssl-uncertainty-tau',
+        type=float,
+        default=0.75,
+        help='Drop pixels whose normalized entropy exceeds this value. 1 keeps every pixel. Placeholder.',
+    )
+    parser.add_argument(
+        '--ssl-pl-threshold',
+        type=float,
+        default=0.0,
+        help='Confidence-threshold pseudo-labels. 0 disables. --ssl-method pl uses 0.95 unless this is set.',
+    )
+    parser.add_argument(
+        '--ssl-recipe',
+        default='',
+        help='Name stored in metrics.json (for example qam-gated-baq-qw). Does not change the loss.',
+    )
+    parser.add_argument(
+        '--ssl-group',
+        default='',
+        help='Table group stored in metrics.json (ablation, baseline, or supervised). Does not change the loss.',
+    )
+    parser.add_argument(
+        '--ssl-fraction',
+        default='',
+        help='Fraction token stored in metrics.json (5, 10, 20, or full). Does not select the split by itself.',
+    )
+    parser.add_argument(
+        '--ssl-out-dir',
+        default='',
+        help='If set, write metrics.json (Dice, mIoU, HD95, ASSD) for scripts/aggregate_media_results.py.',
+    )
+    parser.add_argument(
+        '--ssl-eval-npy',
+        default='',
+        help=(
+            'Optional held-out image .npy used only for eval. data_val.npy and data_test.npy are allowed here. '
+            'They are still refused as unlabeled training data. No download.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-eval-mask-npy',
+        default='',
+        help='Mask .npy paired with --ssl-eval-npy. Eval only.',
+    )
     return parser
 
 
@@ -115,6 +213,40 @@ def parse_train_args(argv=None):
     args, unknown = parser.parse_known_args(argv)
     reserved = [flag for attr, flag, _reason in RESERVED_FLAGS if getattr(args, attr)]
     return args, unknown, reserved
+
+
+def resolve_ssl_method(args):
+    """Apply a baseline preset.
+
+    ``qam`` leaves the flags alone. The other methods force a shared-student
+    baseline so a gate or MQE reweight cannot leak into MT / UA-MT / PL /
+    supervised. Hybrids use ``--ssl-method qam`` plus the low-level flags.
+    """
+    import copy
+
+    method = str(args.ssl_method)
+    if method == 'qam':
+        return args
+    resolved = copy.copy(args)
+    resolved.ssl_gate = 'ungated'
+    resolved.quality_reweight = 'off'
+    resolved.ssl_baq = False
+    resolved.ssl_uncertainty = 'off'
+    resolved.ssl_pl_threshold = 0.0
+    if method == 'mt':
+        return resolved
+    if method == 'uamt':
+        resolved.ssl_uncertainty = 'entropy'
+        resolved.ssl_uncertainty_tau = float(args.ssl_uncertainty_tau)
+        return resolved
+    if method == 'pl':
+        threshold = float(args.ssl_pl_threshold)
+        resolved.ssl_pl_threshold = 0.95 if threshold <= 0.0 else threshold
+        return resolved
+    if method == 'supervised':
+        resolved.ssl_lambda_max = 0.0
+        return resolved
+    raise ValueError(f'Unknown SSL method: {method}')
 
 
 def refuse_reserved_flags(reserved):

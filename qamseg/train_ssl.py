@@ -22,19 +22,29 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 import copy
 from dataclasses import replace
+from typing import Optional
 
 import numpy as np
 import torch
 from torch import nn
 
+from qamseg.aggregate import write_metrics_file
 from qamseg.augment import strong_augment, weak_augment
 from qamseg.backbones import BackboneUnavailable, build_mamba_student
-from qamseg.cli import parse_train_args, refuse_reserved_flags
-from qamseg.data import build_dual_loaders, build_ssl_datasets, iter_dual_batches
+from qamseg.cli import parse_train_args, refuse_reserved_flags, resolve_ssl_method
+from qamseg.data import (
+    ArrayImageDataset,
+    build_dual_loaders,
+    build_ssl_datasets,
+    iter_dual_batches,
+    load_eval_arrays,
+)
 from qamseg.ema import ema_update
-from qamseg.metrics import binary_pixel_metrics, format_eval_log, format_ssl_log, hd95_for_log
+from qamseg.metrics import _distance_pair, binary_pixel_metrics, format_eval_log, format_ssl_log
 from qamseg.mqe import apply_boundary_aware_prior, estimate_quality, gradient_magnitude
-from qamseg.qgc import GateConfig, lambda_u_at_step, quality_gated_consistency_loss, tau_at_step
+from qamseg.qar import QAR_REASON, QAR_STATUS
+from qamseg.qgc import GateConfig, lambda_u_at_step, tau_at_step
+from qamseg.reweight import ReweightConfig, unlabeled_consistency_loss
 from utils import BceDiceLoss
 
 
@@ -74,6 +84,12 @@ def ssl_training_step(
     ema_warmup_steps: int = 0,
     noise_std: float = 0.0,
     use_baq: bool = False,
+    quality_reweight: str = "off",
+    lambda_qw: float = 1.0,
+    qw_ramp: str = "gaussian",
+    uncertainty: str = "off",
+    uncertainty_tau: float = 0.75,
+    pl_threshold: float = 0.0,
 ) -> dict:
     """One labeled step plus one quality-gated unlabeled step.
 
@@ -107,14 +123,38 @@ def ssl_training_step(
     tau = tau_at_step(step, tau0, tau1, warm_steps)
     # The last optimizer step is t = T, so a run of N steps reaches lambda_max
     # on step N-1. Step 0 stays at the foot of the Gaussian ramp.
-    lam = lambda_u_at_step(step, max(int(total_steps) - 1, 1), lambda_max)
-    gated = quality_gated_consistency_loss(
-        pred_strong,
-        teacher_weak,
-        quality,
-        replace(gate, tau=tau),
+    horizon = max(int(total_steps) - 1, 1)
+    lam = lambda_u_at_step(step, horizon, lambda_max)
+    reweight = ReweightConfig(
+        mode=quality_reweight,
+        lambda_qw=float(lambda_qw),
+        ramp=qw_ramp,
+        uncertainty=uncertainty,
+        uncertainty_tau=float(uncertainty_tau),
+        pl_threshold=float(pl_threshold),
     )
-    loss = loss_sup + lam * gated.loss
+    if lam == 0.0:
+        # Supervised preset. The unlabeled view is not part of the objective.
+        loss = loss_sup
+        unsup_value = 0.0
+        keep_fraction = 0.0
+        mean_weight = 0.0
+        qw_alpha = 0.0
+    else:
+        gated = unlabeled_consistency_loss(
+            pred_strong,
+            teacher_weak,
+            quality,
+            replace(gate, tau=tau),
+            reweight,
+            step=step,
+            total_steps=horizon,
+        )
+        loss = loss_sup + lam * gated.loss
+        unsup_value = float(gated.loss.detach())
+        keep_fraction = float(gated.keep_fraction.detach())
+        mean_weight = float(gated.mean_weight.detach())
+        qw_alpha = float(gated.qw_alpha)
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -126,12 +166,17 @@ def ssl_training_step(
         "step": int(step),
         "loss": float(loss.detach()),
         "loss_sup": float(loss_sup.detach()),
-        "loss_unsup": float(gated.loss.detach()),
+        "loss_unsup": unsup_value,
         "lambda_u": float(lam),
-        "gate_keep_fraction": float(gated.keep_fraction.detach()),
-        "mean_gate_weight": float(gated.mean_weight.detach()),
+        "gate_keep_fraction": keep_fraction,
+        "mean_gate_weight": mean_weight,
         "q_mean": float(quality.q.detach().mean()),
         "tau": float(tau),
+        "quality_reweight": str(quality_reweight),
+        "qw_alpha": qw_alpha,
+        "lambda_qw": float(lambda_qw) if quality_reweight != "off" else 0.0,
+        "uncertainty": str(uncertainty),
+        "pl_threshold": float(pl_threshold),
     }
 
 
@@ -150,7 +195,7 @@ def evaluate_loader(model: nn.Module, loader, criterion: nn.Module, threshold: f
     pred = np.concatenate(pred_maps, axis=0)
     gt = np.concatenate(gt_maps, axis=0)
     metrics = binary_pixel_metrics(pred, gt, threshold=threshold)
-    metrics["hd95"] = hd95_for_log([pred], [gt], threshold=threshold)
+    metrics.update(_distance_pair(pred, gt, threshold=threshold))
     metrics["loss"] = float(np.mean(losses)) if losses else float("nan")
     return metrics
 
@@ -170,6 +215,12 @@ def run_ssl_loop(
     lr: float = 1e-3,
     seed: int = 0,
     use_baq: bool = False,
+    quality_reweight: str = "off",
+    lambda_qw: float = 1.0,
+    qw_ramp: str = "gaussian",
+    uncertainty: str = "off",
+    uncertainty_tau: float = 0.75,
+    pl_threshold: float = 0.0,
 ) -> dict:
     torch.manual_seed(seed)
     teacher = copy.deepcopy(student).eval()
@@ -197,6 +248,12 @@ def run_ssl_loop(
                 tau1=tau1,
                 warm_steps=warm_steps,
                 use_baq=use_baq,
+                quality_reweight=quality_reweight,
+                lambda_qw=lambda_qw,
+                qw_ramp=qw_ramp,
+                uncertainty=uncertainty,
+                uncertainty_tau=uncertainty_tau,
+                pl_threshold=pl_threshold,
             )
             history.append(row)
             print(format_ssl_log(row))
@@ -208,13 +265,68 @@ def run_ssl_loop(
     return {"history": history, "metrics": metrics}
 
 
-def run_from_args(args) -> int:
+def _validate_ssl_args(args) -> Optional[str]:
     if int(args.ssl_steps) < 1:
-        print("QAM-Seg: --ssl-steps must be >= 1.")
-        return 2
+        return "--ssl-steps must be >= 1."
     if int(args.ssl_batch_size) < 1:
-        print("QAM-Seg: --ssl-batch-size must be >= 1.")
+        return "--ssl-batch-size must be >= 1."
+    if float(args.ssl_lambda_qw) < 0:
+        return "--ssl-lambda-qw must be non-negative."
+    if not 0.0 <= float(args.ssl_uncertainty_tau) <= 1.0:
+        return "--ssl-uncertainty-tau must lie in [0, 1]."
+    if not 0.0 <= float(args.ssl_pl_threshold) <= 1.0:
+        return "--ssl-pl-threshold must lie in [0, 1]."
+    if bool(args.ssl_eval_npy) != bool(args.ssl_eval_mask_npy):
+        return "Pass both --ssl-eval-npy and --ssl-eval-mask-npy, or neither."
+    return None
+
+
+def _metrics_payload(args, metrics: dict, *, synthetic: bool, eval_split: str, backbone_name: str) -> dict:
+    dice = metrics.get("f1_or_dsc")
+    return {
+        "recipe": str(args.ssl_recipe or args.ssl_method),
+        "method": str(args.ssl_method),
+        "group": str(args.ssl_group),
+        "seed": int(args.ssl_seed),
+        "fraction_token": str(args.ssl_fraction),
+        "fraction": str(args.ssl_fraction),
+        "backbone": backbone_name,
+        "gate": str(args.ssl_gate),
+        "baq": bool(args.ssl_baq),
+        "quality_reweight": str(args.quality_reweight),
+        "lambda_qw": float(args.ssl_lambda_qw) if args.quality_reweight != "off" else 0.0,
+        "qw_ramp": str(args.ssl_qw_ramp),
+        "uncertainty": str(args.ssl_uncertainty),
+        "uncertainty_tau": float(args.ssl_uncertainty_tau),
+        "pl_threshold": float(args.ssl_pl_threshold),
+        "lambda_max": float(args.ssl_lambda_max),
+        "data": "synthetic" if synthetic else "local_npy",
+        "eval_split": eval_split,
+        "experimentally_validated": False,
+        "qar": QAR_STATUS,
+        "steps": int(args.ssl_steps),
+        "metrics": {
+            "dice": dice,
+            "f1_or_dsc": dice,
+            "miou": metrics.get("miou"),
+            "hd95": metrics.get("hd95"),
+            "hd95_mean": metrics.get("hd95_mean"),
+            "assd": metrics.get("assd"),
+            "assd_mean": metrics.get("assd_mean"),
+            "loss": metrics.get("loss"),
+            "accuracy": metrics.get("accuracy"),
+            "sensitivity": metrics.get("sensitivity"),
+            "specificity": metrics.get("specificity"),
+        },
+    }
+
+
+def run_from_args(args) -> int:
+    problem = _validate_ssl_args(args)
+    if problem:
+        print(f"QAM-Seg: {problem}")
         return 2
+    args = resolve_ssl_method(args)
     device = str(args.ssl_device)
     if device.startswith("cuda") and not torch.cuda.is_available():
         print("QAM-Seg: --ssl-device cuda was requested but CUDA is not available.")
@@ -226,6 +338,17 @@ def run_from_args(args) -> int:
     print("Implemented in code and exercised on this process only.")
     print("Not experimentally validated. No ISIC, HAM10000, or PH2 download.")
     print("No CVPR MambaLiteUNet metric is computed or claimed.")
+    print(f"QAR: {QAR_STATUS}. {QAR_REASON}")
+    print(
+        "SSL method: "
+        f"{args.ssl_method}, gate: {args.ssl_gate}, "
+        f"reweight: {args.quality_reweight}, baq: {bool(args.ssl_baq)}, "
+        f"uncertainty: {args.ssl_uncertainty}, pl_threshold: {float(args.ssl_pl_threshold)}."
+    )
+    if args.ssl_method != "qam":
+        print("Baseline preset replaced gate, BAQ, and MQE reweight. Use --ssl-method qam to set those yourself.")
+    if float(args.ssl_lambda_max) == 0.0:
+        print("Supervised objective: unlabeled consistency is not applied.")
     if args.use_learned_quality_head:
         print("Learned MQE head flag is set, but the head stays a stub (weight a3 = 0, beta = 0).")
     backbone = str(args.ssl_backbone)
@@ -273,16 +396,27 @@ def run_from_args(args) -> int:
         print("Lower --ssl-batch-size, or pass a local array with at least one full batch.")
         print("This entry point does not download ISIC, HAM10000, or PH2.")
         return 2
+    eval_split = "synthetic_labeled" if synthetic else "labeled_train_subset"
     try:
-        val_labeled, _val_unlabeled = build_ssl_datasets(
-            length=length,
-            size=int(args.ssl_image_size),
-            seed=int(args.ssl_seed) + 17,
-            unlabeled_npy="",
-            labeled_npy=args.ssl_labeled_npy,
-            mask_npy=args.ssl_mask_npy,
-            split_json=args.ssl_split,
-        )
+        if args.ssl_eval_npy:
+            eval_images, eval_masks = load_eval_arrays(args.ssl_eval_npy, args.ssl_eval_mask_npy)
+            val_labeled = ArrayImageDataset(eval_images, eval_masks)
+            eval_split = "held_out"
+            print("Eval: held-out arrays from --ssl-eval-npy. They are not added to the unlabeled pool.")
+            print("This is still not a published Dice, HD95, or ASSD result.")
+        else:
+            val_labeled, _val_unlabeled = build_ssl_datasets(
+                length=length,
+                size=int(args.ssl_image_size),
+                seed=int(args.ssl_seed) + 17,
+                unlabeled_npy="",
+                labeled_npy=args.ssl_labeled_npy,
+                mask_npy=args.ssl_mask_npy,
+                split_json=args.ssl_split,
+            )
+            if not synthetic:
+                print("Eval: labeled train rows used for this run. Not a held-out test score.")
+                print("Pass --ssl-eval-npy and --ssl-eval-mask-npy when a local val or test array exists.")
     except (FileNotFoundError, ValueError) as exc:
         print(f"QAM-Seg: {exc}")
         return 2
@@ -292,6 +426,10 @@ def run_from_args(args) -> int:
         batch_size=int(args.ssl_batch_size),
         shuffle=False,
     )
+    if len(val_loader) == 0:
+        print("QAM-Seg: the eval loader is empty after drop_last.")
+        print("Lower --ssl-batch-size. This entry point does not download a dataset.")
+        return 2
     if device == "cuda":
         student = student.cuda()
         # Loaders yield CPU tensors. Move them inside the loop only if asked.
@@ -314,10 +452,28 @@ def run_from_args(args) -> int:
         warm_steps=int(args.ssl_warm_steps),
         seed=int(args.ssl_seed),
         use_baq=bool(args.ssl_baq),
+        quality_reweight=str(args.quality_reweight),
+        lambda_qw=float(args.ssl_lambda_qw),
+        qw_ramp=str(args.ssl_qw_ramp),
+        uncertainty=str(args.ssl_uncertainty),
+        uncertainty_tau=float(args.ssl_uncertainty_tau),
+        pl_threshold=float(args.ssl_pl_threshold),
     )
     if not result["history"]:
         print("QAM-Seg: SSL loop produced no steps.")
         return 1
+    if args.ssl_out_dir:
+        payload = _metrics_payload(
+            args,
+            result["metrics"],
+            synthetic=synthetic,
+            eval_split=eval_split,
+            backbone_name="mamba" if backbone == "mamba" else "tiny",
+        )
+        destination = os.path.join(str(args.ssl_out_dir), "metrics.json")
+        write_metrics_file(destination, payload)
+        print(f"Wrote {destination}")
+        print("metrics.json is a wiring record unless a held-out eval array was passed and the run is a real training job.")
     return 0
 
 

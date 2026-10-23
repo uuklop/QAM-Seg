@@ -58,7 +58,11 @@ and [LICENSE](LICENSE).
 - [scripts/count_params_flops.py](scripts/count_params_flops.py): parameter
   count, and FLOPs when `thop` or `fvcore` can run a forward, at 256×256.
 - HD95 (pixels) on the existing validation and test logs, without replacing
-  accuracy, sensitivity, specificity, Dice, or mIoU.
+  accuracy, sensitivity, specificity, Dice, or mIoU. ASSD is logged beside
+  HD95 in the same pixel units.
+- MQE reweighting of the unlabeled loss (`--quality-reweight`), fair MT /
+  UA-MT / PL baselines, and a multi-seed MedIA runner. No extra quality
+  network. See [docs/MEDIA_NOTES.md](docs/MEDIA_NOTES.md).
 
 No dataset is downloaded and no training run is part of this change.
 
@@ -339,19 +343,54 @@ python scripts/make_labeled_fraction_splits.py --help
 python -m unittest discover -s tests -v
 ```
 
-`--ssl-backbone` defaults to `tiny`. `--ssl-backbone mamba` imports
-`models.MambaLiteUNet` and exits non-zero if the import fails. The split
+`--ssl-backbone` defaults to `tiny` (`TinySegStudent`, the convolutional
+fallback; there is no separate ConvLiteUNet class). `--ssl-backbone mamba`
+imports `models.MambaLiteUNet` and exits non-zero if the import fails. The split
 script writes `splits/<name>/seed<seed>/fraction_{5,10,20}.json` plus CSV
 id lists. Pointing `python train.py --ssl --ssl-split ...` at those files
 requires local train arrays; a missing path exits with an error and does
-not download ISIC, HAM10000, or PH2. The step log adds unlabeled loss and
-`gate_keep_fraction`. The eval log keeps loss, mIoU, Dice (`f1_or_dsc`),
-accuracy, specificity, sensitivity, and HD95. Those numbers are wiring
-checks, not dataset scores. Ablations `--no-amf`, `--no-lgfm`, and
-`--no-cga` still exit 2. AMF, LGFM, and CGA are unchanged upstream
-modules. Details are in [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md).
+not download ISIC, HAM10000, or PH2.
 
-## 5. Citation
+`--quality-reweight off` (the default) leaves the previous QGC loss in
+place. `sample` or `pixel` reweights that unlabeled term with the existing
+MQE score. The weight ramps from uniform to the score (`--ssl-qw-ramp`,
+default `gaussian`). `--ssl-lambda-qw` defaults to 1; QG-SSL used 0.25.
+There is no third quality network and no QAR term. `--ssl-method mt`,
+`uamt`, `pl`, or `supervised` forces a baseline on the same student and
+clears the MQE gate, BAQ, and reweight. `uamt` uses teacher entropy. It
+does not add dropout to MambaLiteUNet.
+
+```bash
+python scripts/run_media_protocol.py --dry-run
+python scripts/aggregate_media_results.py results/media_protocol
+```
+
+The step log adds unlabeled loss, `gate_keep_fraction`, and `reweight`.
+The eval log keeps loss, mIoU, Dice (`f1_or_dsc`), accuracy, specificity,
+sensitivity, HD95, and ASSD. Those numbers are wiring checks, not dataset
+scores. Ablations `--no-amf`, `--no-lgfm`, and `--no-cga` still exit 2.
+AMF, LGFM, and CGA are unchanged upstream modules. Details and the
+QG-SSL comparison are in [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md). The
+MedIA checklist is [docs/MEDIA_NOTES.md](docs/MEDIA_NOTES.md).
+
+## 5. Related work
+
+MambaLiteUNet is the supervised backbone (CVPR 2026; citation below).
+QAM-Seg does not claim that paper's metrics.
+
+QG-SSL (Abhishek and Hamarneh, MICCAI 2026, arXiv:2606.01753) trains a
+separate quality predictor and either regularizes the segmentor through
+it (QAR) or reweights pseudolabels with it (PL-QW). QAM-Seg keeps quality
+inside MQE, QGC, and optional BAQ on the mean-teacher loop. The new
+reweight flag is the PL-QW pattern using that in-loop score. QAR is not
+added: without an external predictor it collapses into entropy
+minimization plus consistency, which the MT / UA-MT baselines already
+cover and which fights BAQ. The protocol runner compares QAM-Seg with
+plain mean teacher, entropy UA-MT, and confidence-threshold
+pseudo-labels on one student and one split. See
+[docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md).
+
+## 6. Citation
 
 Cite the upstream paper for the backbone. This fork does not add a QAM-Seg
 paper citation.
@@ -366,7 +405,7 @@ paper citation.
 }
 ```
 
-## 6. Acknowledgements
+## 7. Acknowledgements
 
 The ISIC 2017 and ISIC 2018 challenges, and the releases of HAM10000 and PH2,
 are the datasets the upstream work credits. Dataset access is unchanged by
@@ -376,7 +415,7 @@ this fork. The upstream README also acknowledges
 [VM-UNet](https://github.com/JCruan519/VM-UNet), and
 [UltraLight-VM-UNet](https://github.com/wurenkai/UltraLight-VM-UNet).
 
-## 7. Issues
+## 8. Issues
 
 GitHub issue tracking for a fork is a repository setting. This tree does not
 turn that setting on. Questions about AMF, LGFM, CGA, or the CVPR tables

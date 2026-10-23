@@ -5,6 +5,8 @@
 synthetic blobs with a tiny conv student, so it does not need a GPU,
 ``mamba_ssm``, or ISIC/HAM/PH2. That run checks the wiring. It is not an
 experiment and it does not report a Dice or HD95 result.
+``--ssl-backbone mamba`` requires ``--ssl-device cuda`` because
+``mamba_ssm`` selective scan is CUDA-only.
 """
 
 from __future__ import annotations
@@ -426,6 +428,25 @@ def _metrics_payload(
     return payload
 
 
+def _cuda_selected_and_available(device: str) -> bool:
+    return str(device).startswith("cuda") and torch.cuda.is_available()
+
+
+def _mamba_without_cuda_message(device: str) -> str:
+    """User-facing refusal. ``mamba_ssm`` selective scan rejects CPU tensors."""
+    lines = [
+        "QAM-Seg: --ssl-backbone mamba requires CUDA.",
+        "mamba_ssm selective scan is CUDA-only (selective_scan_cuda requires CUDA tensors).",
+        "Re-run with --ssl-device cuda.",
+    ]
+    if str(device).startswith("cuda"):
+        lines.append("--ssl-device cuda was requested but CUDA is not available.")
+    lines.append(
+        "The tiny conv student was not substituted, because this backbone was explicitly requested."
+    )
+    return "\n".join(lines)
+
+
 def run_from_args(args) -> int:
     problem = _validate_ssl_args(args)
     if problem:
@@ -433,6 +454,10 @@ def run_from_args(args) -> int:
         return 2
     args = resolve_ssl_method(args)
     device = str(args.ssl_device)
+    backbone = str(args.ssl_backbone)
+    if backbone == "mamba" and not _cuda_selected_and_available(device):
+        print(_mamba_without_cuda_message(device))
+        return 2
     if device.startswith("cuda") and not torch.cuda.is_available():
         print("QAM-Seg: --ssl-device cuda was requested but CUDA is not available.")
         print("The synthetic smoke path runs on CPU. Re-run with --ssl-device cpu.")
@@ -463,7 +488,6 @@ def run_from_args(args) -> int:
     if args.use_learned_quality_head:
         print("Learned MQE head flag is set, but the head stays a stub (weight a3 = 0, beta = 0).")
 
-    backbone = str(args.ssl_backbone)
     use_amf = not (bool(getattr(args, "no_amf", False)) or bool(getattr(args, "ablate_amf", False)))
     use_lgfm = not (bool(getattr(args, "no_lgfm", False)) or bool(getattr(args, "ablate_lgfm", False)))
     use_cga = not (bool(getattr(args, "no_cga", False)) or bool(getattr(args, "ablate_cga", False)))

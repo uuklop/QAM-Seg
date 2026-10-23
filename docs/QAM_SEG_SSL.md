@@ -26,7 +26,8 @@ covered by synthetic unit tests (`tests/`).**
 | Flag | Meaning |
 | --- | --- |
 | `--ssl` | Run the QAM-Seg SSL training loop (`qamseg.train_ssl`) |
-| `--ssl-backbone {tiny,mamba}` | `tiny` (CPU smoke default) or `mamba` (`models.MambaLiteUNet`) |
+| `--ssl-backbone {tiny,mamba}` | `tiny` (CPU smoke default) or `mamba` (`models.MambaLiteUNet`). `mamba` requires `--ssl-device cuda` |
+| `--ssl-device {cpu,cuda}` | `cpu` by default. `tiny` runs on CPU. `mamba` does not: `mamba_ssm` selective scan is CUDA-only |
 | `--ssl-split PATH` | Slice local train `.npy` arrays with `fraction_5.json`, `fraction_10.json`, or `fraction_20.json` |
 | `--ssl-gate {gated,hard,soft,ungated}` | QGC gating mode |
 | `--quality-reweight {off,sample,pixel}` | MQE reweighting of the unlabeled consistency loss |

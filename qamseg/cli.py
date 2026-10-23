@@ -83,7 +83,15 @@ def build_parser():
         help='Global branch inside LGFM: attn (MultiheadAttention) or spectral (2D FFT).',
     )
     parser.add_argument('--ssl-steps', type=int, default=2, help='SSL optimizer steps. Default is a smoke length.')
-    parser.add_argument('--ssl-device', default='cpu', choices=('cpu', 'cuda'))
+    parser.add_argument(
+        '--ssl-device',
+        default='cpu',
+        choices=('cpu', 'cuda'),
+        help=(
+            'Device for the SSL loop. tiny runs on cpu (the default). '
+            'mamba requires cuda because mamba_ssm selective scan is CUDA-only.'
+        ),
+    )
     parser.add_argument('--ssl-batch-size', type=int, default=2)
     parser.add_argument('--ssl-image-size', type=int, default=32)
     parser.add_argument(
@@ -128,7 +136,9 @@ def build_parser():
         choices=('tiny', 'mamba'),
         help=(
             'SSL student. tiny (default) is the CPU conv stand-in. '
-            'mamba imports models.MambaLiteUNet and exits non-zero if that import fails. '
+            'mamba imports models.MambaLiteUNet, requires --ssl-device cuda '
+            '(mamba_ssm selective scan is CUDA-only), and exits non-zero if that '
+            'import fails or CUDA is not available. It does not fall back to tiny. '
             'Ignored unless --ssl is set. Not a CVPR run.'
         ),
     )

@@ -1,9 +1,11 @@
 """SSL student factory.
 
-``tiny`` is the CPU conv student used by the default smoke path. ``mamba``
+``tiny`` is ``TinySegStudent``, the CPU convolutional fallback used by the
+default smoke path. There is no separate ConvLiteUNet module. ``mamba``
 constructs ``models.MambaLiteUNet`` when that import succeeds. A failed import
 is reported and is fatal only when ``mamba`` was requested. The supervised
-``python train.py`` path does not use this module.
+``python train.py`` path does not use this module. MambaLiteUNet is the
+backbone, not a second quality model.
 """
 
 from __future__ import annotations

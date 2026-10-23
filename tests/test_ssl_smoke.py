@@ -91,7 +91,7 @@ class SmokeTests(unittest.TestCase):
             self.assertIn("unsup:", text)
             self.assertIn("gate_keep_fraction:", text)
         metrics = result["metrics"]
-        for key in ("loss", "miou", "f1_or_dsc", "accuracy", "specificity", "sensitivity", "hd95"):
+        for key in ("loss", "miou", "f1_or_dsc", "accuracy", "specificity", "sensitivity", "hd95", "assd"):
             self.assertIn(key, metrics)
         self.assertIn("hd95:", format_eval_log(metrics))
 
@@ -142,7 +142,7 @@ class SupervisedFilesUntouchedTests(unittest.TestCase):
     def test_engine_still_logs_the_existing_metrics(self):
         with open("engine.py", encoding="utf-8") as handle:
             text = handle.read()
-        for key in ("f1_or_dsc", "miou", "hd95", "sensitivity", "specificity"):
+        for key in ("f1_or_dsc", "miou", "hd95", "assd", "sensitivity", "specificity"):
             self.assertIn(key, text)
 
     def test_train_py_keeps_the_supervised_entry(self):

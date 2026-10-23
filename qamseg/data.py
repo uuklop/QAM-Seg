@@ -150,13 +150,10 @@ def load_unlabeled_array(path: str) -> Tensor:
     return images
 
 
-def load_labeled_arrays(image_path: str, mask_path: str) -> tuple[Tensor, Tensor]:
-    """Load a local labeled pair. Same message as the unlabeled path: no download."""
-    _refuse_heldout_array(image_path)
-    _refuse_heldout_array(mask_path)
+def _read_image_mask_files(image_path: str, mask_path: str) -> tuple[Tensor, Tensor]:
     if not os.path.isfile(image_path) or not os.path.isfile(mask_path):
         missing = image_path if not os.path.isfile(image_path) else mask_path
-        raise FileNotFoundError(f"Labeled array not found: {missing}. {UNLABELED_TODO}")
+        raise FileNotFoundError(f"Array not found: {missing}. {UNLABELED_TODO}")
     images = _to_nchw(np.load(image_path))
     masks = torch.from_numpy(np.ascontiguousarray(np.load(mask_path))).float()
     if masks.ndim == 3:
@@ -168,13 +165,32 @@ def load_labeled_arrays(image_path: str, mask_path: str) -> tuple[Tensor, Tensor
     masks = (masks > 0).float()
     if masks.shape[0] != images.shape[0]:
         raise ValueError(
-            f"Labeled count mismatch: {images.shape[0]} images vs {masks.shape[0]} masks"
+            f"Count mismatch: {images.shape[0]} images vs {masks.shape[0]} masks"
         )
     if masks.shape[-2:] != images.shape[-2:]:
         raise ValueError(
-            f"Labeled spatial mismatch: images {tuple(images.shape)} masks {tuple(masks.shape)}"
+            f"Spatial mismatch: images {tuple(images.shape)} masks {tuple(masks.shape)}"
         )
     return images, masks
+
+
+def load_labeled_arrays(image_path: str, mask_path: str) -> tuple[Tensor, Tensor]:
+    """Load a local labeled pair. Same message as the unlabeled path: no download."""
+    _refuse_heldout_array(image_path)
+    _refuse_heldout_array(mask_path)
+    return _read_image_mask_files(image_path, mask_path)
+
+
+def load_eval_arrays(image_path: str, mask_path: str) -> tuple[Tensor, Tensor]:
+    """Load a held-out eval pair. Never an unlabeled training pool.
+
+    ``data_val.npy`` and ``data_test.npy`` are allowed here and still refused
+    by ``load_labeled_arrays`` / ``load_unlabeled_array``. A missing path
+    raises ``FileNotFoundError`` and does not download anything.
+    """
+    if not image_path or not mask_path:
+        raise ValueError("Pass both --ssl-eval-npy and --ssl-eval-mask-npy, or neither.")
+    return _read_image_mask_files(image_path, mask_path)
 
 
 def datasets_from_split(image_path: str, mask_path: str, split_path: str) -> tuple[Dataset, Dataset]:

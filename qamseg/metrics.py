@@ -9,7 +9,8 @@ on synthetic blobs are wiring checks, not dataset scores.
 
 from __future__ import annotations
 
-from typing import Sequence
+import math
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -50,20 +51,59 @@ def hd95_for_log(preds: Sequence, gts: Sequence, threshold: float = 0.5) -> str:
         return f"n/a ({type(exc).__name__}: {exc})"
 
 
+def _distance_pair(pred, gt, threshold: float) -> dict:
+    """Numeric HD95 / ASSD plus the log strings. Failures stay ``n/a``."""
+    try:
+        from utils import format_hd95, summarize_assd, summarize_hd95
+    except Exception as exc:
+        text = f"n/a ({type(exc).__name__}: {exc})"
+        return {"hd95": text, "hd95_mean": None, "assd": text, "assd_mean": None}
+    try:
+        hd = summarize_hd95([pred], [gt], threshold=threshold)
+        ad = summarize_assd([pred], [gt], threshold=threshold)
+    except Exception as exc:
+        text = f"n/a ({type(exc).__name__}: {exc})"
+        return {"hd95": text, "hd95_mean": None, "assd": text, "assd_mean": None}
+    return {
+        "hd95": format_hd95(hd),
+        "hd95_mean": _finite_mean(hd),
+        "assd": format_hd95(ad),
+        "assd_mean": _finite_mean(ad),
+    }
+
+
+def _finite_mean(summary: dict) -> Optional[float]:
+    if not summary or summary.get("status") != "ok":
+        return None
+    mean = summary.get("mean")
+    if mean is None:
+        return None
+    mean = float(mean)
+    if math.isnan(mean) or math.isinf(mean):
+        return None
+    return mean
+
+
 def format_ssl_log(row: dict) -> str:
-    return (
+    text = (
         f"ssl: step {row['step']}, loss: {row['loss']:.4f}, "
         f"sup: {row['loss_sup']:.4f}, unsup: {row['loss_unsup']:.4f}, "
         f"lambda_u: {row['lambda_u']:.4f}, "
         f"gate_keep_fraction: {row['gate_keep_fraction']:.4f}, "
         f"q_mean: {row['q_mean']:.4f}, tau: {row['tau']:.4f}"
     )
+    if "quality_reweight" in row:
+        text += f", reweight: {row['quality_reweight']}"
+    if "qw_alpha" in row:
+        text += f", qw_alpha: {float(row['qw_alpha']):.4f}"
+    return text
 
 
 def format_eval_log(metrics: dict) -> str:
+    assd = metrics.get("assd", "n/a")
     return (
         f"ssl-eval: loss: {metrics['loss']:.4f}, miou: {metrics['miou']}, "
         f"f1_or_dsc: {metrics['f1_or_dsc']}, accuracy: {metrics['accuracy']}, "
         f"specificity: {metrics['specificity']}, sensitivity: {metrics['sensitivity']}, "
-        f"hd95: {metrics['hd95']}"
+        f"hd95: {metrics['hd95']}, assd: {assd}"
     )

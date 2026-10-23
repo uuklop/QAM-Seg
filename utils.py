@@ -352,6 +352,33 @@ def _binary_surface(mask):
     return surface
 
 
+def _surface_distances(pred_mask, gt_mask):
+    """Directed surface distances for a binary pair.
+
+    Returns ``(pred_to_gt, gt_to_pred)``. Both-empty maps are distance 0
+    and are reported as empty arrays plus ``both_empty=True``. One-empty
+    maps are undefined. Shapes must already match.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    pred_mask = np.asarray(pred_mask, dtype=bool)
+    gt_mask = np.asarray(gt_mask, dtype=bool)
+    if pred_mask.shape != gt_mask.shape:
+        raise ValueError(
+            f'Surface-distance shape mismatch: pred {pred_mask.shape} vs gt {gt_mask.shape}'
+        )
+    if not pred_mask.any() and not gt_mask.any():
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64), True
+    if not pred_mask.any() or not gt_mask.any():
+        return None, None, False
+
+    pred_surface = _binary_surface(pred_mask)
+    gt_surface = _binary_surface(gt_mask)
+    pred_to_gt = distance_transform_edt(~gt_surface)[pred_surface]
+    gt_to_pred = distance_transform_edt(~pred_surface)[gt_surface]
+    return pred_to_gt, gt_to_pred, False
+
+
 def hd95_binary(pred_mask, gt_mask):
     """Symmetric 95th-percentile surface Hausdorff distance, in pixels.
 
@@ -361,34 +388,33 @@ def hd95_binary(pred_mask, gt_mask):
     asserted to match medpy bit for bit, and it does not apply millimetre
     spacing because the loader does not provide any.
     """
-    from scipy.ndimage import distance_transform_edt
-
-    pred_mask = np.asarray(pred_mask, dtype=bool)
-    gt_mask = np.asarray(gt_mask, dtype=bool)
-    if pred_mask.shape != gt_mask.shape:
-        raise ValueError(
-            f'HD95 shape mismatch: pred {pred_mask.shape} vs gt {gt_mask.shape}'
-        )
-    if not pred_mask.any() and not gt_mask.any():
+    pred_to_gt, gt_to_pred, both_empty = _surface_distances(pred_mask, gt_mask)
+    if both_empty:
         return 0.0
-    if not pred_mask.any() or not gt_mask.any():
+    if pred_to_gt is None:
         return float('nan')
-
-    pred_surface = _binary_surface(pred_mask)
-    gt_surface = _binary_surface(gt_mask)
-    pred_to_gt = distance_transform_edt(~gt_surface)[pred_surface]
-    gt_to_pred = distance_transform_edt(~pred_surface)[gt_surface]
     distances = np.concatenate([pred_to_gt, gt_to_pred])
     return float(np.percentile(distances, 95))
 
 
-def summarize_hd95(preds, gts, threshold=0.5, gt_threshold=0.5):
-    """Mean HD95 over paired prediction / label arrays.
+def assd_binary(pred_mask, gt_mask):
+    """Average symmetric surface distance, in pixels.
 
-    Returns a dict and never raises ImportError. Missing SciPy yields
-    status 'unavailable' so the existing confusion-matrix metrics can
-    still be logged. Other failures are the caller's responsibility.
+    The mean of the concatenated directed surface distances. Both-empty
+    maps are 0. One-empty maps are undefined (NaN). Same surface definition
+    as ``hd95_binary``. No millimetre spacing.
     """
+    pred_to_gt, gt_to_pred, both_empty = _surface_distances(pred_mask, gt_mask)
+    if both_empty:
+        return 0.0
+    if pred_to_gt is None:
+        return float('nan')
+    distances = np.concatenate([pred_to_gt, gt_to_pred])
+    return float(np.mean(distances))
+
+
+def _summarize_surface(preds, gts, distance_fn, threshold=0.5, gt_threshold=0.5, label='surface'):
+    """Mean of a per-map surface distance. Missing SciPy is status 'unavailable'."""
     try:
         import scipy.ndimage  # noqa: F401
     except ImportError:
@@ -409,11 +435,11 @@ def summarize_hd95(preds, gts, threshold=0.5, gt_threshold=0.5):
         gt_maps = list(_iter_mask2d(gt))
         if len(pred_maps) != len(gt_maps):
             raise ValueError(
-                f'HD95 batch mismatch: {len(pred_maps)} preds vs {len(gt_maps)} labels'
+                f'{label} batch mismatch: {len(pred_maps)} preds vs {len(gt_maps)} labels'
             )
         for pred_map, gt_map in zip(pred_maps, gt_maps):
             total += 1
-            distance = hd95_binary(pred_map >= threshold, gt_map >= gt_threshold)
+            distance = distance_fn(pred_map >= threshold, gt_map >= gt_threshold)
             if np.isnan(distance):
                 undefined += 1
             else:
@@ -428,6 +454,25 @@ def summarize_hd95(preds, gts, threshold=0.5, gt_threshold=0.5):
         'undefined': undefined,
         'total': total,
     }
+
+
+def summarize_hd95(preds, gts, threshold=0.5, gt_threshold=0.5):
+    """Mean HD95 over paired prediction / label arrays.
+
+    Returns a dict and never raises ImportError. Missing SciPy yields
+    status 'unavailable' so the existing confusion-matrix metrics can
+    still be logged. Other failures are the caller's responsibility.
+    """
+    return _summarize_surface(
+        preds, gts, hd95_binary, threshold=threshold, gt_threshold=gt_threshold, label='HD95'
+    )
+
+
+def summarize_assd(preds, gts, threshold=0.5, gt_threshold=0.5):
+    """Mean ASSD over paired prediction / label arrays. Same contract as HD95."""
+    return _summarize_surface(
+        preds, gts, assd_binary, threshold=threshold, gt_threshold=gt_threshold, label='ASSD'
+    )
 
 
 def format_hd95(summary):

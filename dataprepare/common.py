@@ -8,11 +8,32 @@ segmentation masks.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
 from PIL import Image
+
+
+# Central raw-image store on this lab machine. Override with env var for other hosts.
+IMAGE_DATASETS_ROOT = Path(
+    os.environ.get(
+        "QAMSEG_IMAGE_DATASETS_ROOT",
+        "/home/icdmlab/Downloads/Image_Datasets",
+    )
+).expanduser()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_raw_dir(dataset_name: str) -> str:
+    """Absolute path under IMAGE_DATASETS_ROOT for a named dataset folder."""
+    return str(IMAGE_DATASETS_ROOT / dataset_name)
+
+
+def default_out_dir(dataset_name: str) -> str:
+    """Absolute path under the project ``data/<dataset>/`` for processed .npy files."""
+    return str(PROJECT_ROOT / "data" / dataset_name)
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
@@ -70,6 +91,7 @@ def collect_paired_files(
     mask_dirs: Sequence[str | Path],
     *,
     extensions: Sequence[str] = IMAGE_EXTENSIONS,
+    exclude_stem_substrings: Sequence[str] = (),
 ) -> list[tuple[Path, Path]]:
     """Discover and deterministically sort ``(image_path, mask_path)`` pairs by image stem."""
     img_paths: dict[str, Path] = {}
@@ -79,6 +101,8 @@ def collect_paired_files(
             continue
         for entry in sorted(p.iterdir()):
             if entry.is_file() and entry.suffix.lower() in extensions:
+                if any(sub in entry.stem for sub in exclude_stem_substrings):
+                    continue
                 img_paths.setdefault(entry.stem, entry)
 
     mask_dir_paths = [Path(d) for d in mask_dirs]

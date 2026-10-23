@@ -11,7 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dataprepare.common import build_and_save_splits, collect_paired_files  # noqa: E402
+from dataprepare.common import (  # noqa: E402
+    build_and_save_splits,
+    collect_paired_files,
+    default_out_dir,
+    default_raw_dir,
+)
 
 
 def discover_ham10000_pairs(
@@ -24,6 +29,7 @@ def discover_ham10000_pairs(
         "ISIC2018_Task3_Training_Input",
     ),
     mask_subdirs: tuple[str, ...] = (
+        "HAM10000_segmentations_lesion_tschandl/HAM10000_segmentations_lesion_tschandl",
         "HAM10000_segmentations_lesion_tschandl",
         "HAM10000_segmentations",
         "masks",
@@ -50,8 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prepare HAM10000 images and masks into data_*.npy / mask_*.npy."
     )
-    parser.add_argument("--data-dir", default="./HAM10000", help="Root HAM10000 folder.")
-    parser.add_argument("--out-dir", default="./data/HAM10000", help="Output .npy folder.")
+    parser.add_argument("--data-dir", default=default_raw_dir("HAM10000"), help="Root HAM10000 folder (default: Image_Datasets/HAM10000).")
+    parser.add_argument("--out-dir", default=default_out_dir("HAM10000"), help="Output .npy folder (default: project data/HAM10000).")
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--train-count", type=int, default=None)

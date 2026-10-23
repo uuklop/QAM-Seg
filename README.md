@@ -112,32 +112,23 @@ paper initializes the AMF residual scale α to 0.
 and a `combine` convolution. Issue #3 calls those extra stages out as
 another paper-versus-code difference. This fork does not remove them.
 
-### Phantom dataset scripts
+### Dataset prepare scripts
 
-The upstream README tells readers to run `prepare_HAM10000.py` and
-`prepare_PH2.py`. **Those files are not in this repository.** Do not expect
-them. Issue #4 also notes their absence. HAM10000 and PH2 are not prepared
-by any script here.
-
-Scripts that do exist, under `dataprepare/` (not the repository root):
+Prepare scripts live under `dataprepare/` (PIL-based; no `scipy.misc`). On this
+lab machine they default to the central raw store
+`/home/icdmlab/Downloads/Image_Datasets/<Dataset>` and write processed
+`.npy` files into `<project>/data/<Dataset>/`. Override with `--data-dir` /
+`--out-dir`, or set env `QAMSEG_IMAGE_DATASETS_ROOT`.
 
 | Script | In repo? |
 | --- | --- |
 | `dataprepare/prepare_ISIC2017.py` | yes |
 | `dataprepare/prepare_ISIC2018.py` | yes |
+| `dataprepare/prepare_HAM10000.py` | yes |
+| `dataprepare/prepare_PH2.py` | yes |
 | `dataprepare/prepare_custom_dataset.py` | yes |
-| `prepare_HAM10000.py` | **no** |
-| `prepare_PH2.py` | **no** |
 
-The ISIC prepare scripts call `scipy.misc.imread` and `scipy.misc.imresize`,
-which are not in current SciPy. The upstream README's separate Python 3.7
-environment with `scipy==1.2.1` is still the note that applies to those
-files. They also read images from `./ISIC2017/` or `./ISIC2018/` relative
-to the working directory and write `data_*.npy` / `mask_*.npy` into the
-working directory. `loader.py` reads those arrays from `config.data_path`
-(`./data/ISIC2017/` or `./data/ISIC2018/`). Move the six `.npy` files into
-that directory after preparation. The old README paths `/data/ISIC2017/`
-and a root-level `python prepare_ISIC2017.py` do not match this tree.
+`loader.py` still reads arrays from `config.data_path` (e.g. `./data/ISIC2017/`).
 
 ## 1. Environment setup (supervised backbone)
 
@@ -198,25 +189,20 @@ upstream ones, with the paths corrected to files that exist.
 
 ### ISIC 2017
 
-1. Download from the [ISIC 2017 challenge](https://challenge.isic-archive.com/data).
-2. Place the training images and ground truth where
-   `dataprepare/prepare_ISIC2017.py` looks: `./ISIC2017/` relative to the
-   working directory (see the `Dataset_add` variable in that file).
-3. Run:
+1. Keep raw challenge files under
+   `/home/icdmlab/Downloads/Image_Datasets/ISIC2017` (or pass `--data-dir`).
+2. From the project root, with `rfg_env` active:
 
    ```bash
    python dataprepare/prepare_ISIC2017.py
    ```
 
-4. Move `data_train.npy`, `data_val.npy`, `data_test.npy`, `mask_train.npy`,
-   `mask_val.npy`, and `mask_test.npy` to `./data/ISIC2017/`.
-5. In `configs/config_setting.py`, set `datasets = 'ISIC2017'`.
+   Writes `.npy` splits directly to `./data/ISIC2017/`.
+3. In `configs/config_setting.py`, set `datasets = 'ISIC2017'`.
 
 ### ISIC 2018
 
-Same pattern. The script reads `./ISIC2018/` and
-`configs/config_setting.py` defaults `datasets` to `'ISIC2018'` with
-`data_path = './data/ISIC2018/'`.
+Same pattern (`Image_Datasets/ISIC2018` → `./data/ISIC2018/`):
 
 ```bash
 python dataprepare/prepare_ISIC2018.py
@@ -224,8 +210,13 @@ python dataprepare/prepare_ISIC2018.py
 
 ### HAM10000 and PH2
 
-No prepare script is shipped. See ERRATA. Nothing in this fork reproduces
-those splits.
+```bash
+python dataprepare/prepare_HAM10000.py
+python dataprepare/prepare_PH2.py
+```
+
+Defaults: `Image_Datasets/HAM10000` → `./data/HAM10000/`, and
+`Image_Datasets/PH2` → `./data/PH2/`.
 
 ### Custom data
 

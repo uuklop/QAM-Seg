@@ -15,6 +15,8 @@ from dataprepare.common import (  # noqa: E402
     IMAGE_EXTENSIONS,
     build_and_save_splits,
     collect_paired_files,
+    default_out_dir,
+    default_raw_dir,
 )
 
 
@@ -70,8 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prepare PH2 dermoscopic images and masks into data_*.npy / mask_*.npy."
     )
-    parser.add_argument("--data-dir", default="./PH2", help="Root PH2 dataset folder.")
-    parser.add_argument("--out-dir", default="./data/PH2", help="Output .npy folder.")
+    parser.add_argument("--data-dir", default=default_raw_dir("PH2"), help="Root PH2 dataset folder (default: Image_Datasets/PH2).")
+    parser.add_argument("--out-dir", default=default_out_dir("PH2"), help="Output .npy folder (default: project data/PH2).")
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--train-count", type=int, default=None)

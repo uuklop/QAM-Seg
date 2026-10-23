@@ -8,10 +8,13 @@ experiment and it does not report a Dice or HD95 result.
 
 The step itself takes any student that maps ``(B, 3, H, W)`` to a sigmoid
 mask ``(B, 1, H, W)``. ``--ssl-backbone mamba`` builds
-``models.MambaLiteUNet`` when that import works. The default remains
-``TinySegStudent``. A prepared split is optional and only indexes local
-arrays; this module still does not download medical data or report a
-dataset Dice or HD95.
+``models.MambaLiteUNet`` when that import works and exits if it does not.
+``--ssl-backbone conv`` builds ``models.ConvLiteUNet``, a capacity-matched
+CNN stand-in that does not import ``mamba_ssm``. That student is not
+MambaLiteUNet and its logs must not be reported as Mamba metrics. The
+default remains ``TinySegStudent``. A prepared split is optional and only
+indexes local arrays; this module still does not download medical data or
+report a dataset Dice or HD95.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ from torch import nn
 
 from qamseg.aggregate import write_metrics_file
 from qamseg.augment import strong_augment, weak_augment
-from qamseg.backbones import BackboneUnavailable, build_mamba_student
+from qamseg.backbones import BackboneUnavailable, ConvLiteUnavailable, build_conv_student, build_mamba_student
 from qamseg.cli import parse_train_args, refuse_reserved_flags, resolve_ssl_method
 from qamseg.data import (
     ArrayImageDataset,
@@ -278,7 +281,30 @@ def _validate_ssl_args(args) -> Optional[str]:
         return "--ssl-pl-threshold must lie in [0, 1]."
     if bool(args.ssl_eval_npy) != bool(args.ssl_eval_mask_npy):
         return "Pass both --ssl-eval-npy and --ssl-eval-mask-npy, or neither."
+    synthetic = not (args.ssl_unlabeled_npy or args.ssl_labeled_npy or args.ssl_mask_npy or args.ssl_split)
+    if str(args.ssl_backbone) == "conv" and synthetic and int(args.ssl_image_size) < 32:
+        return (
+            "ConvLiteUNet needs --ssl-image-size >= 32 on the synthetic path "
+            "(five stride-2 pools). Real .npy runs use the array spatial size. "
+            "The tiny smoke student stays the default."
+        )
     return None
+
+
+_BACKBONE_STUDENT = {
+    "tiny": "TinySegStudent",
+    "conv": "ConvLiteUNet",
+    "mamba": "MambaLiteUNet",
+}
+
+
+def _backbone_record_name(backbone: str) -> str:
+    """Name stored in metrics.json. ConvLite is never recorded as Mamba."""
+    if backbone == "mamba":
+        return "mamba"
+    if backbone == "conv":
+        return "conv"
+    return "tiny"
 
 
 def _metrics_payload(args, metrics: dict, *, synthetic: bool, eval_split: str, backbone_name: str) -> dict:
@@ -291,6 +317,7 @@ def _metrics_payload(args, metrics: dict, *, synthetic: bool, eval_split: str, b
         "fraction_token": str(args.ssl_fraction),
         "fraction": str(args.ssl_fraction),
         "backbone": backbone_name,
+        "student": _BACKBONE_STUDENT.get(backbone_name, backbone_name),
         "gate": str(args.ssl_gate),
         "baq": bool(args.ssl_baq),
         "quality_reweight": str(args.quality_reweight),
@@ -359,6 +386,16 @@ def run_from_args(args) -> int:
             print(exc)
             return 2
         print("Student: MambaLiteUNet. Import succeeded.")
+        print("This is not a CVPR reproduction. Logs from this process are not medical Dice or HD95 results.")
+    elif backbone == "conv":
+        try:
+            student = build_conv_student()
+        except ConvLiteUnavailable as exc:
+            print(exc)
+            return 2
+        print("Student: ConvLiteUNet.")
+        print("ConvLiteUNet is a capacity-matched CNN stand-in. It does not import mamba_ssm.")
+        print("It is not MambaLiteUNet. Do not report these logs as Mamba metrics.")
         print("This is not a CVPR reproduction. Logs from this process are not medical Dice or HD95 results.")
     else:
         student = TinySegStudent()
@@ -468,7 +505,7 @@ def run_from_args(args) -> int:
             result["metrics"],
             synthetic=synthetic,
             eval_split=eval_split,
-            backbone_name="mamba" if backbone == "mamba" else "tiny",
+            backbone_name=_backbone_record_name(backbone),
         )
         destination = os.path.join(str(args.ssl_out_dir), "metrics.json")
         write_metrics_file(destination, payload)

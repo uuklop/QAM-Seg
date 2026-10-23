@@ -20,6 +20,9 @@ A real run needs local train arrays. This script does not download them.
         --eval-npy ./data/ISIC2018/data_test.npy \\
         --eval-mask-npy ./data/ISIC2018/mask_test.npy \\
         --backbone mamba --steps 20000 --out-dir results/media_isic2018
+
+``--backbone conv`` selects ConvLiteUNet and does not import ``mamba_ssm``.
+That student is not MambaLiteUNet. ``--smoke`` still forces ``tiny``.
 """
 
 from __future__ import annotations
@@ -64,8 +67,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backbone",
         default="tiny",
-        choices=("tiny", "mamba"),
-        help="tiny is the CPU conv fallback. mamba is MambaLiteUNet and exits if that import fails.",
+        choices=("tiny", "conv", "mamba"),
+        help=(
+            "tiny (default) is the CPU smoke student. "
+            "conv is ConvLiteUNet, a GPU-friendly CNN fallback that does not import mamba_ssm. "
+            "It is not MambaLiteUNet. "
+            "mamba is MambaLiteUNet and exits if that import fails. "
+            "--smoke always uses tiny."
+        ),
     )
     parser.add_argument("--image-size", type=int, default=None, help="Synthetic smoke spatial size. Ignored for .npy arrays.")
     parser.add_argument("--train-npy", default="", help="Local data_train.npy. Refuses val/test names. No download.")
@@ -143,6 +152,8 @@ def main(argv=None) -> int:
     if smoke and args.device == "cpu":
         pass
 
+    requested_backbone = str(args.backbone)
+    run_backbone = "tiny" if smoke else requested_backbone
     split_for = {}
     if execute and not smoke:
         try:
@@ -170,7 +181,7 @@ def main(argv=None) -> int:
             steps=args.steps,
             batch_size=int(args.batch_size),
             device="cpu" if smoke else args.device,
-            backbone="tiny" if smoke else args.backbone,
+            backbone=run_backbone,
             image_size=args.image_size if smoke or args.image_size else None,
             labeled_npy=labeled,
             mask_npy=mask,
@@ -209,11 +220,16 @@ def main(argv=None) -> int:
         "default_fractions": list(DEFAULT_FRACTIONS),
         "smoke": smoke,
         "dry_run": bool(args.dry_run),
+        "backbone": run_backbone,
+        "requested_backbone": requested_backbone,
         "qar": "skipped",
         "quality_network": "none",
         "note": (
             "Same student and split for every recipe. "
             "No g_phi, SAM, CLIP, YOLO, or text module. "
+            "tiny is the CPU smoke student. "
+            "conv is ConvLiteUNet and is not MambaLiteUNet. "
+            "mamba is MambaLiteUNet and is not replaced when that import fails. "
             "This file is not a Dice or HD95 result. "
             "The script does not download a dataset."
         ),

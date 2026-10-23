@@ -93,9 +93,11 @@ def build_parser():
     parser.add_argument(
         '--ssl-backbone',
         default='tiny',
-        choices=('tiny', 'mamba'),
+        choices=('tiny', 'conv', 'mamba'),
         help=(
-            'SSL student. tiny (default) is the CPU conv stand-in. '
+            'SSL student. tiny (default) is the CPU smoke stand-in. '
+            'conv is models.ConvLiteUNet, a capacity-matched CNN fallback that does not '
+            'import mamba_ssm and must not be reported as Mamba. '
             'mamba imports models.MambaLiteUNet and exits non-zero if that import fails. '
             'Ignored unless --ssl is set. Not a CVPR run.'
         ),

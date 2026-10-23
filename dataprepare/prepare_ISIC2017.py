@@ -2,8 +2,9 @@
 """Prepare ISIC 2017 dataset into .npy arrays using PIL (no legacy scipy.misc required).
 
 Default split for 2000 training images: 1250 train, 150 val, 600 test.
-Writes arrays to ``--out-dir`` (default ``./data/ISIC2017``) and optionally to
-the current working directory when ``--also-save-cwd`` is set.
+Defaults: raw root ``IMAGE_DATASETS_ROOT/ISIC2017``, output ``<project>/data/ISIC2017``.
+Override with ``--data-dir`` / ``--out-dir`` or env ``QAMSEG_IMAGE_DATASETS_ROOT``.
+Optionally also write into cwd when ``--also-save-cwd`` is set.
 """
 
 from __future__ import annotations
@@ -16,7 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dataprepare.common import build_and_save_splits, collect_paired_files  # noqa: E402
+from dataprepare.common import (  # noqa: E402
+    build_and_save_splits,
+    collect_paired_files,
+    default_out_dir,
+    default_raw_dir,
+)
 
 
 def discover_isic2017_pairs(data_dir: str | Path) -> list[tuple[Path, Path]]:
@@ -24,26 +30,43 @@ def discover_isic2017_pairs(data_dir: str | Path) -> list[tuple[Path, Path]]:
     if not root.is_dir():
         raise FileNotFoundError(
             f"ISIC 2017 directory not found: {root}. "
-            "Place ISIC2017_Task1-2_Training_Input and ISIC2017_Task1_Training_GroundTruth "
-            "under --data-dir. This script does not download datasets."
+            "Expected training images/masks under --data-dir "
+            "(e.g. ISIC-2017_Training_Data + ISIC-2017_Training_Part1_GroundTruth, "
+            "or ISIC2017_Task1-2_Training_Input + ISIC2017_Task1_Training_GroundTruth). "
+            "This script does not download datasets."
         )
     img_dirs = [
         root / sub
-        for sub in ("ISIC2017_Task1-2_Training_Input", "images", "input")
+        for sub in (
+            "ISIC-2017_Training_Data",
+            "ISIC2017_Task1-2_Training_Input",
+            "images",
+            "input",
+        )
         if (root / sub).is_dir()
     ] or [root]
     msk_dirs = [
         root / sub
-        for sub in ("ISIC2017_Task1_Training_GroundTruth", "masks", "groundtruth")
+        for sub in (
+            "ISIC-2017_Training_Part1_GroundTruth",
+            "ISIC2017_Task1_Training_GroundTruth",
+            "masks",
+            "groundtruth",
+        )
         if (root / sub).is_dir()
     ] or [root]
-    return collect_paired_files(img_dirs, msk_dirs)
+    # Official dumps ship *_superpixels.png beside *.jpg; exclude those stems.
+    return collect_paired_files(
+        img_dirs,
+        msk_dirs,
+        exclude_stem_substrings=("_superpixels",),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare ISIC 2017 into .npy splits.")
-    parser.add_argument("--data-dir", default="./ISIC2017")
-    parser.add_argument("--out-dir", default="./data/ISIC2017")
+    parser.add_argument("--data-dir", default=default_raw_dir("ISIC2017"))
+    parser.add_argument("--out-dir", default=default_out_dir("ISIC2017"))
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--train-count", type=int, default=None)

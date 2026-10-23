@@ -2,8 +2,9 @@
 """Prepare ISIC 2018 dataset into .npy arrays using PIL (no legacy scipy.misc required).
 
 Default split for 2594 training images: 1815 train, 259 val, 520 test.
-Writes arrays to ``--out-dir`` (default ``./data/ISIC2018``) and optionally to
-the current working directory when ``--also-save-cwd`` is set.
+Defaults: raw root ``IMAGE_DATASETS_ROOT/ISIC2018``, output ``<project>/data/ISIC2018``.
+Override with ``--data-dir`` / ``--out-dir`` or env ``QAMSEG_IMAGE_DATASETS_ROOT``.
+Optionally also write into cwd when ``--also-save-cwd`` is set.
 """
 
 from __future__ import annotations
@@ -16,7 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dataprepare.common import build_and_save_splits, collect_paired_files  # noqa: E402
+from dataprepare.common import (  # noqa: E402
+    build_and_save_splits,
+    collect_paired_files,
+    default_out_dir,
+    default_raw_dir,
+)
 
 
 def discover_isic2018_pairs(data_dir: str | Path) -> list[tuple[Path, Path]]:
@@ -42,8 +48,8 @@ def discover_isic2018_pairs(data_dir: str | Path) -> list[tuple[Path, Path]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare ISIC 2018 into .npy splits.")
-    parser.add_argument("--data-dir", default="./ISIC2018")
-    parser.add_argument("--out-dir", default="./data/ISIC2018")
+    parser.add_argument("--data-dir", default=default_raw_dir("ISIC2018"))
+    parser.add_argument("--out-dir", default=default_out_dir("ISIC2018"))
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--train-count", type=int, default=None)

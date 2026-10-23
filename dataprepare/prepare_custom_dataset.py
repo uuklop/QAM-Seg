@@ -11,14 +11,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dataprepare.common import build_and_save_splits, collect_paired_files  # noqa: E402
+from dataprepare.common import (  # noqa: E402
+    build_and_save_splits,
+    collect_paired_files,
+    default_out_dir,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare custom images/ and masks/ into .npy splits.")
     parser.add_argument("--image-dir", default="images")
     parser.add_argument("--mask-dir", default="masks")
-    parser.add_argument("--out-dir", default="./data/custom")
+    parser.add_argument("--out-dir", default=default_out_dir("custom"))
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--train-count", type=int, default=None)

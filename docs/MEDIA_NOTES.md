@@ -35,3 +35,7 @@ The protocol runner (`scripts/run_media_protocol.py`) defaults to MambaLiteUNet 
 | `qam-qw-pixel` | Ungated pixel-level MQE reweighting |
 | `qam-qar` | `qam-gated-baq-qw` + Quality-Guided Feature Prototype Alignment (`--ssl-qar prototype`) |
 | `qam-full` | `qam-qar` + Quality-Guided CutMix (`--ssl-cutmix`) |
+
+## Gate threshold defaults (MQE q scale)
+
+Defaults are `--ssl-tau0 0.35` → `--ssl-tau1 0.55` with warm ≈ `0.3 * steps` when `--ssl-warm-steps` is left at the smoke value `1`. An older `0.4→0.8` schedule shut the hard image gate on ISIC (MQE `q` typically stays ~0.45–0.75), so unlabeled loss stayed at 0 for most steps. `metrics.json` records `mean_gate_keep` / `frac_gate_open`; per-step rows go to `train_log.jsonl`.

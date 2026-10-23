@@ -25,8 +25,9 @@ and before any epoch runs.
 | Flag | Meaning | Wired? |
 | --- | --- | --- |
 | `--ssl` | MQE + QGC. Default process is a short CPU smoke on synthetic blobs | Yes (code, not a benchmark) |
-| `--ssl-backbone tiny` | `TinySegStudent`, the CPU convolutional fallback. Does not import `mamba_ssm`. There is no separate ConvLiteUNet class | Yes |
-| `--ssl-backbone mamba` | SSL student is `models.MambaLiteUNet` when that import works. A failed import exits non-zero and does not fall back, because the backbone was requested | Yes, optional |
+| `--ssl-backbone tiny` | `TinySegStudent`, the default CPU smoke student. Does not import `mamba_ssm` | Yes |
+| `--ssl-backbone conv` | `models.ConvLiteUNet`, capacity-matched CNN stand-in. No `mamba_ssm`. Not Mamba. GPU fallback when the Mamba wheel will not build | Yes |
+| `--ssl-backbone mamba` | SSL student is `models.MambaLiteUNet` when that import works. A failed import exits non-zero and does not fall back to tiny or conv | Yes, optional |
 | `--ssl-split PATH` | Slice a local train `.npy` pair with `fraction_5.json`, `fraction_10.json`, or `fraction_20.json` | Yes, local files only |
 | `--ssl-gate ungated` | Uniform consistency weights. With reweight off, this is plain mean teacher | Yes |
 | `--quality-reweight {off,sample,pixel}` | MQE reweight of the unlabeled term. `off` (default) keeps the previous QGC loss | Yes |
@@ -49,13 +50,14 @@ python -m qamseg.train_ssl
 data. It runs `qamseg.train_ssl`. The default student is a tiny conv net
 so the loss, the gate, and the log line can execute without a GPU and
 without `mamba_ssm`. `--ssl-steps` defaults to 2 for that reason.
-`--ssl-backbone mamba` is the only switch that constructs
-`MambaLiteUNet`, and only after `models.MambaLiteUNet` imports. If that
-import fails, the process prints the reason and exits non-zero. It does
-not silently keep the tiny student. Omitting the flag, or passing
-`--ssl-backbone tiny`, never imports the backbone. Passing
-`--ssl-backbone` without `--ssl` prints one line and leaves supervised
-training unchanged.
+`--ssl-backbone mamba` constructs `MambaLiteUNet` only after
+`models.MambaLiteUNet` imports. If that import fails, the process prints
+the reason and exits non-zero. It does not silently keep the tiny student
+or switch to ConvLite. `--ssl-backbone conv` constructs `ConvLiteUNet`
+and does not import `mamba_ssm`. Metrics from that student stay labeled
+`conv`. Omitting the flag, or passing `--ssl-backbone tiny`, never imports
+either backbone. Passing `--ssl-backbone` without `--ssl` prints one line
+and leaves supervised training unchanged.
 
 Passing `--no-amf`, `--no-lgfm`, or `--no-cga` with or without `--ssl`
 still exits 2. Those bypasses are not wired; turning them on would change
@@ -210,8 +212,10 @@ python scripts/run_media_protocol.py --smoke --recipes qam-qw,mt --seeds 0 --fra
 
 A real run refuses to start without `--train-npy`, `--mask-npy`, and
 `--steps`. It writes splits with the existing fraction tool and does not
-download data. `--backbone mamba` is the student for that run. The default
-`--backbone tiny` stays the CPU fallback.
+download data. `--backbone mamba` is the paper student for that run and
+exits if the import fails. `--backbone conv` selects ConvLiteUNet without
+`mamba_ssm`. The default `--backbone tiny` stays the CPU smoke student.
+`--smoke` always uses tiny.
 
 `scripts/aggregate_media_results.py` reads each `metrics.json` and writes
 `summary.csv` and `summary.md` with mean ± sample std (ddof=1) for Dice,
@@ -346,7 +350,9 @@ python train.py --ssl \
 ```
 
 Add `--ssl-backbone mamba` on a machine where `MambaLiteUNet` imports.
-The default without that flag stays `TinySegStudent`, including when the
+If `mamba_ssm` cannot be imported, `--ssl-backbone conv` is the
+capacity-matched CNN stand-in. Record that choice as ConvLite, not Mamba.
+The default without either flag stays `TinySegStudent`, including when the
 split flags are set. Eval printed after these steps is the labeled
 subset used for the run. It is not a held-out test score and it is not a
 Dice or HD95 result on ISIC, HAM10000, or PH2.
@@ -368,9 +374,10 @@ dataset scores and they do not replace the supervised log.
 ## What is still open
 
 - Run the MedIA protocol on a prepared labeled fraction with
-  `--backbone mamba`, three seeds, and a held-out `--eval-npy`. This
-  repository still does not run that training, and it still does not
-  publish a medical Dice, mIoU, HD95, or ASSD. See
+  `--backbone mamba` when that import works, or `--backbone conv` when
+  `mamba_ssm` does not. Label the backbone in the table. ConvLite rows
+  are not Mamba rows. This repository still does not run that training,
+  and it still does not publish a medical Dice, mIoU, HD95, or ASSD. See
   [MEDIA_NOTES.md](MEDIA_NOTES.md).
 - HAM10000 and PH2 still have no prepare script in this tree. Do not use
   test images as unlabeled data.

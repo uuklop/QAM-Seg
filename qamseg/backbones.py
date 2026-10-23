@@ -1,11 +1,9 @@
 """SSL student factory.
 
-``tiny`` is ``TinySegStudent``, the CPU convolutional fallback used by the
-default smoke path. There is no separate ConvLiteUNet module. ``mamba``
-constructs ``models.MambaLiteUNet`` when that import succeeds. A failed import
-is reported and is fatal only when ``mamba`` was requested. The supervised
-``python train.py`` path does not use this module. MambaLiteUNet is the
-backbone, not a second quality model.
+The SSL student is ``models.MambaLiteUNet``. A failed import or construction
+is fatal. Nothing is substituted. The supervised ``python train.py`` path
+does not use this module. MambaLiteUNet is the backbone, not a second
+quality model.
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ DEFAULT_C_LIST = [16, 32, 48, 64, 96, 128]
 
 
 class BackboneUnavailable(Exception):
-    """``--ssl-backbone mamba`` was requested and the class did not construct."""
+    """MambaLiteUNet did not import or construct. Nothing is substituted."""
 
     def __init__(self, cause: BaseException):
         self.cause = cause
@@ -27,11 +25,9 @@ class BackboneUnavailable(Exception):
 
     def format_message(self) -> str:
         return (
-            "QAM-Seg: --ssl-backbone mamba was requested, but models.MambaLiteUNet "
-            "could not be imported or constructed.\n"
+            "QAM-Seg: MambaLiteUNet could not be imported or constructed.\n"
             f"Reason: {type(self.cause).__name__}: {self.cause}\n"
-            "The tiny conv student was not substituted, because this backbone was explicitly requested.\n"
-            "Re-run with the default (omit --ssl-backbone, or pass --ssl-backbone tiny).\n"
+            "The SSL student is MambaLiteUNet. No other student is substituted.\n"
             "This process does not install packages and does not download datasets.\n"
             "A successful import is still not a medical training run and does not report CVPR Dice or HD95."
         )

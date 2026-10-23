@@ -7,10 +7,10 @@ ablation ungated / gated / gated+BAQ / gated+BAQ+sample-reweight, plus
 the ungated sample-reweight PL-QW analogue (``qam-qw``).
 
 ``--dry-run`` writes the command list and does not train.
-``--smoke`` runs one synthetic CPU step per selected job. It does not
-read ISIC, HAM10000, or PH2.
+``--smoke`` runs one synthetic CUDA step per selected job on MambaLiteUNet.
+It does not read ISIC, HAM10000, or PH2. There is no CPU student.
 
-A real run needs local train arrays. This script does not download them.
+A real run needs local train arrays and CUDA. This script does not download them.
 
     python scripts/run_media_protocol.py --dry-run --out-dir results/media_protocol
     python scripts/run_media_protocol.py --smoke --recipes qam-qw,mt --seeds 0 --fractions 10
@@ -19,7 +19,7 @@ A real run needs local train arrays. This script does not download them.
         --mask-npy ./data/ISIC2018/mask_train.npy \\
         --eval-npy ./data/ISIC2018/data_test.npy \\
         --eval-mask-npy ./data/ISIC2018/mask_test.npy \\
-        --backbone mamba --steps 20000 --out-dir results/media_isic2018
+        --steps 20000 --out-dir results/media_isic2018
 """
 
 from __future__ import annotations
@@ -60,14 +60,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--steps", type=int, default=None, help="Optimizer steps. Required for a real run. Not a tuned budget.")
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        choices=("cpu", "cuda"),
+        help=(
+            "Passed through as --ssl-device. Default cuda. "
+            "cpu is refused: MambaLiteUNet selective scan is CUDA-only."
+        ),
+    )
     parser.add_argument(
         "--backbone",
-        default="tiny",
-        choices=("tiny", "mamba"),
-        help="tiny is the CPU conv fallback. mamba is MambaLiteUNet and exits if that import fails.",
+        default="mamba",
+        choices=("mamba",),
+        help="SSL student. mamba is MambaLiteUNet. A failed import exits non-zero. No other student is substituted.",
     )
-    parser.add_argument("--image-size", type=int, default=None, help="Synthetic smoke spatial size. Ignored for .npy arrays.")
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help="Synthetic smoke spatial size. MambaLiteUNet needs at least 32. Ignored for .npy arrays.",
+    )
     parser.add_argument("--train-npy", default="", help="Local data_train.npy. Refuses val/test names. No download.")
     parser.add_argument("--mask-npy", default="", help="Local mask_train.npy paired with --train-npy.")
     parser.add_argument("--eval-npy", default="", help="Optional held-out image array (data_val.npy or data_test.npy).")
@@ -77,8 +90,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uncertainty-tau", type=float, default=0.75)
     parser.add_argument("--pl-threshold", type=float, default=0.95)
     parser.add_argument("--dry-run", action="store_true", help="Write protocol_manifest.json and do not train.")
-    parser.add_argument("--smoke", action="store_true", help="Synthetic CPU jobs. Does not read a medical array.")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Synthetic CUDA jobs on MambaLiteUNet. Does not read a medical array.",
+    )
     return parser
+
+
+def _cuda_student_ready(device: str) -> bool:
+    """MambaLiteUNet selective scan is CUDA-only. Nothing is substituted."""
+    if device != "cuda":
+        print("QAM-Seg: --device cpu was requested.")
+        print("The protocol student is MambaLiteUNet. mamba_ssm selective scan is CUDA-only.")
+        print("No other student is substituted.")
+        return False
+    try:
+        import torch
+    except ImportError:
+        print("QAM-Seg: PyTorch is not importable.")
+        print("The protocol student is MambaLiteUNet. mamba_ssm selective scan is CUDA-only.")
+        print("No other student is substituted.")
+        return False
+    if not torch.cuda.is_available():
+        print("QAM-Seg: CUDA is not available.")
+        print("The protocol student is MambaLiteUNet. mamba_ssm selective scan is CUDA-only.")
+        print("No other student is substituted.")
+        return False
+    return True
 
 
 def _job_dir(out_dir: Path, seed: int, recipe: str, fraction_token: str) -> Path:
@@ -139,9 +178,9 @@ def main(argv=None) -> int:
     if smoke and args.steps is None:
         args.steps = 1
     if smoke and args.image_size is None:
-        args.image_size = 16
-    if smoke and args.device == "cpu":
-        pass
+        args.image_size = 32
+    if execute and not _cuda_student_ready(args.device):
+        return 2
 
     split_for = {}
     if execute and not smoke:
@@ -169,8 +208,8 @@ def main(argv=None) -> int:
             job,
             steps=args.steps,
             batch_size=int(args.batch_size),
-            device="cpu" if smoke else args.device,
-            backbone="tiny" if smoke else args.backbone,
+            device=args.device,
+            backbone=args.backbone,
             image_size=args.image_size if smoke or args.image_size else None,
             labeled_npy=labeled,
             mask_npy=mask,

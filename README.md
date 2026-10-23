@@ -46,11 +46,11 @@ and [LICENSE](LICENSE).
 - [docs/QAM_SEG_SSL.md](docs/QAM_SEG_SSL.md): MQE and QGC. Implemented in
   code, unit-tested on synthetic tensors, not experimentally validated.
 - `--ssl` runs that path (`python train.py --ssl` or
-  `python -m qamseg.train_ssl`). The default is a short CPU smoke on
-  synthetic blobs with a tiny student. `--ssl-backbone mamba` uses
-  `MambaLiteUNet` only when that import works; a failed import exits
-  non-zero instead of falling back. `--no-amf`, `--no-lgfm`, and
-  `--no-cga` are still refused.
+  `python -m qamseg.train_ssl`). The default is a short CUDA smoke on
+  synthetic blobs with MambaLiteUNet. `mamba_ssm` selective scan is
+  CUDA-only: if CUDA is unavailable, or the import fails, the process
+  exits non-zero and does not substitute another student. `--no-amf`,
+  `--no-lgfm`, and `--no-cga` are still refused.
 - `scripts/make_labeled_fraction_splits.py` writes deterministic 5%/10%/20%
   labeled subsets and complementary unlabeled pools for a local train id
   list or `data_train.npy`. It does not download data. See
@@ -180,7 +180,8 @@ the upstream `requirements.txt`.
 
 `train.py` (with no flags) and `test.py` call `.cuda()` and
 `torch.cuda.empty_cache()`. They are the upstream GPU training path.
-`--ssl` is a separate CPU smoke loop and does not replace that path.
+`--ssl` is a separate MambaLiteUNet loop on CUDA and does not replace
+that path. It does not run a CPU student.
 
 ## 2. Dataset preparation
 
@@ -323,10 +324,12 @@ pip install fvcore
 
 MQE (`qamseg/mqe.py`) and QGC (`qamseg/qgc.py`) are implemented.
 `python train.py` with no flags does not run them. `python train.py --ssl`
-and `python -m qamseg.train_ssl` do. The default student is a tiny
-convolution, the default images are synthetic blobs, and the default length
-is two optimizer steps on CPU. That checks the wiring. It is not a
-training result, and it does not claim a Dice or HD95 score.
+and `python -m qamseg.train_ssl` do. The student is MambaLiteUNet, the
+default images are synthetic blobs, and the default length is two
+optimizer steps on CUDA (`--ssl-device cuda`). That checks the wiring.
+It is not a training result, and it does not claim a Dice or HD95 score.
+`mamba_ssm` selective scan is CUDA-only. If CUDA is unavailable the
+process exits and does not substitute another student.
 
 ```bash
 python train.py --ssl
@@ -334,13 +337,15 @@ python scripts/make_labeled_fraction_splits.py --help
 python -m unittest discover -s tests -v
 ```
 
-`--ssl-backbone` defaults to `tiny` (`TinySegStudent`, the convolutional
-fallback; there is no separate ConvLiteUNet class). `--ssl-backbone mamba`
-imports `models.MambaLiteUNet` and exits non-zero if the import fails. The split
+`--ssl-backbone` accepts only `mamba` (`models.MambaLiteUNet`), which is
+also the default. Import or construction failure exits non-zero. The split
 script writes `splits/<name>/seed<seed>/fraction_{5,10,20}.json` plus CSV
 id lists. Pointing `python train.py --ssl --ssl-split ...` at those files
 requires local train arrays; a missing path exits with an error and does
-not download ISIC, HAM10000, or PH2.
+not download ISIC, HAM10000, or PH2. Synthetic `--ssl-image-size` must be
+at least 32 because MambaLiteUNet uses five stride-2 pools. Unit tests
+skip MambaLiteUNet smokes when CUDA or `mamba_ssm` is missing. MQE, QGC,
+and reweight tensor tests still run.
 
 `--quality-reweight off` (the default) leaves the previous QGC loss in
 place. `sample` or `pixel` reweights that unlabeled term with the existing

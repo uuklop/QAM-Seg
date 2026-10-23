@@ -17,6 +17,8 @@ SSL upgrades are implemented and verified by unit tests (`tests/`).
    - **Uncancelled Image-Level Quality Weights**: `quality_gated_consistency_loss` normalizes spatial weights per active image while preserving the continuous image quality weight $q^\gamma$.
    - **Quality-Guided Feature Prototype Alignment (`--ssl-qar prototype`) & CutMix (`--ssl-cutmix`)**: Adds representation-level boundary regularization (`prototype_quality_regularization`) and region mixing (`quality_guided_cutmix`), available via recipes `qam-qar` and `qam-full`.
 
+The protocol runner (`scripts/run_media_protocol.py`) defaults to MambaLiteUNet (`--backbone mamba`) and `--device cuda`. `--smoke` is a short synthetic wiring check on that same student. `mamba_ssm` selective scan is CUDA-only, so a machine without CUDA exits instead of substituting another student.
+
 ## Recipes in `qamseg/protocol.py`
 
 | Recipe | Description |

@@ -23,7 +23,7 @@ def build_parser():
         prog='train.py',
         description=(
             'Supervised MambaLiteUNet training used as the QAM-Seg backbone. '
-            '--ssl runs the quality-aware SSL path (synthetic CPU smoke by default). '
+            '--ssl runs the quality-aware SSL path (short CUDA smoke on synthetic blobs by default). '
             'Ablation flags are still refused unless --allow-ablation is set.'
         ),
     )
@@ -31,8 +31,8 @@ def build_parser():
         '--ssl',
         action='store_true',
         help=(
-            'Enable MQE + QGC. Default is a short CPU run on synthetic blobs, '
-            'not an ISIC/HAM/PH2 experiment. See docs/QAM_SEG_SSL.md.'
+            'Enable MQE + QGC on MambaLiteUNet. Default is a short CUDA run on synthetic blobs, '
+            'not an ISIC/HAM/PH2 experiment. Requires CUDA. See docs/QAM_SEG_SSL.md.'
         ),
     )
     parser.add_argument(
@@ -83,9 +83,22 @@ def build_parser():
         help='Global branch inside LGFM: attn (MultiheadAttention) or spectral (2D FFT).',
     )
     parser.add_argument('--ssl-steps', type=int, default=2, help='SSL optimizer steps. Default is a smoke length.')
-    parser.add_argument('--ssl-device', default='cpu', choices=('cpu', 'cuda'))
+    parser.add_argument(
+        '--ssl-device',
+        default='cuda',
+        choices=('cpu', 'cuda'),
+        help=(
+            'Device for the SSL student. Default cuda. mamba_ssm selective scan is CUDA-only. '
+            'cpu is refused. If CUDA is unavailable the process exits and does not substitute another student.'
+        ),
+    )
     parser.add_argument('--ssl-batch-size', type=int, default=2)
-    parser.add_argument('--ssl-image-size', type=int, default=32)
+    parser.add_argument(
+        '--ssl-image-size',
+        type=int,
+        default=32,
+        help='Synthetic spatial size. MambaLiteUNet needs at least 32 (five stride-2 pools).',
+    )
     parser.add_argument(
         '--ssl-gate',
         default='gated',
@@ -124,11 +137,11 @@ def build_parser():
     )
     parser.add_argument(
         '--ssl-backbone',
-        default='tiny',
-        choices=('tiny', 'mamba'),
+        default='mamba',
+        choices=('mamba',),
         help=(
-            'SSL student. tiny (default) is the CPU conv stand-in. '
-            'mamba imports models.MambaLiteUNet and exits non-zero if that import fails. '
+            'SSL student. mamba (the only choice, and the default) is models.MambaLiteUNet. '
+            'Import or construction failure exits non-zero. No other student is substituted. '
             'Ignored unless --ssl is set. Not a CVPR run.'
         ),
     )

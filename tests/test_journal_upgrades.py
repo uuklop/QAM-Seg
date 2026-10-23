@@ -3,10 +3,15 @@
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 import numpy as np
 import torch
 import torch.nn as nn
+
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 from qamseg.augment import (
     augment_labeled_batch,
@@ -18,7 +23,9 @@ from qamseg.data import ArrayImageDataset, build_dual_loaders, iter_dual_batches
 from qamseg.mqe import QualityWeights, dice_agreement, estimate_quality
 from qamseg.qar import prototype_quality_regularization
 from qamseg.qgc import GateConfig, quality_gated_consistency_loss
-from qamseg.train_ssl import TinySegStudent, run_ssl_loop
+from qamseg.backbones import build_mamba_student
+from qamseg.train_ssl import run_ssl_loop
+from require_mamba_cuda import skip_unless_mamba_cuda
 
 
 def _install_mock_mamba_and_timm():
@@ -253,16 +260,28 @@ class MambaDisagreementAndPrototypeQarTests(unittest.TestCase):
         loss_qar.backward()
         self.assertIsNotNone(student_features.grad)
 
+    @skip_unless_mamba_cuda
     def test_ssl_loop_with_cutmix_and_prototype_qar_runs_cleanly(self):
         from qamseg.data import build_ssl_datasets
 
-        labeled, unlabeled = build_ssl_datasets(length=4, size=16, seed=1)
+        def _cuda_loader(loader):
+            class _Loader:
+                def __len__(self):
+                    return len(loader)
+
+                def __iter__(self):
+                    for batch in loader:
+                        yield type(batch)(item.cuda() for item in batch)
+
+            return _Loader()
+
+        labeled, unlabeled = build_ssl_datasets(length=4, size=32, seed=1)
         l_loader, u_loader = build_dual_loaders(labeled, unlabeled, batch_size=2)
         result = run_ssl_loop(
-            TinySegStudent(),
-            l_loader,
-            u_loader,
-            l_loader,
+            build_mamba_student().cuda(),
+            _cuda_loader(l_loader),
+            _cuda_loader(u_loader),
+            _cuda_loader(l_loader),
             steps=2,
             gate=GateConfig(mode="gated", level="both"),
             lambda_max=1.0,

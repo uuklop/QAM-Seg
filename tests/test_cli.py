@@ -3,8 +3,14 @@
 import subprocess
 import sys
 import unittest
+from pathlib import Path
+
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 from qamseg.cli import parse_train_args, refuse_reserved_flags
+from require_mamba_cuda import skip_unless_mamba_cuda
 
 
 class ParseTests(unittest.TestCase):
@@ -29,6 +35,7 @@ class ParseTests(unittest.TestCase):
 
 
 class SubprocessTests(unittest.TestCase):
+    @skip_unless_mamba_cuda
     def test_train_py_ssl_smoke_exits_0(self):
         completed = subprocess.run(
             [
@@ -38,7 +45,7 @@ class SubprocessTests(unittest.TestCase):
                 "--ssl-steps",
                 "1",
                 "--ssl-image-size",
-                "16",
+                "32",
                 "--ssl-batch-size",
                 "2",
             ],
@@ -52,9 +59,10 @@ class SubprocessTests(unittest.TestCase):
         self.assertIn("hd95:", completed.stdout)
         self.assertIn("Not experimentally validated", completed.stdout)
 
+    @skip_unless_mamba_cuda
     def test_module_entry_exits_0(self):
         completed = subprocess.run(
-            [sys.executable, "-m", "qamseg.train_ssl", "--ssl-steps", "1", "--ssl-image-size", "16"],
+            [sys.executable, "-m", "qamseg.train_ssl", "--ssl-steps", "1", "--ssl-image-size", "32"],
             check=False,
             capture_output=True,
             text=True,

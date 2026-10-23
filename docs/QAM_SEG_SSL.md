@@ -25,8 +25,10 @@ covered by synthetic unit tests (`tests/`).**
 
 | Flag | Meaning |
 | --- | --- |
-| `--ssl` | Run the QAM-Seg SSL training loop (`qamseg.train_ssl`) |
-| `--ssl-backbone {tiny,mamba}` | `tiny` (CPU smoke default) or `mamba` (`models.MambaLiteUNet`) |
+| `--ssl` | Run the QAM-Seg SSL training loop (`qamseg.train_ssl`) on MambaLiteUNet |
+| `--ssl-backbone` | `mamba` only (`models.MambaLiteUNet`). This is the default student. A failed import exits. No other student is substituted. |
+| `--ssl-device {cpu,cuda}` | `cuda` (default). `mamba_ssm` selective scan is CUDA-only. `cpu`, or `cuda` when CUDA is missing, exits. No other student is substituted. |
+| `--ssl-image-size` | Synthetic spatial size. Default 32. MambaLiteUNet needs at least 32 (five stride-2 pools). |
 | `--ssl-split PATH` | Slice local train `.npy` arrays with `fraction_5.json`, `fraction_10.json`, or `fraction_20.json` |
 | `--ssl-gate {gated,hard,soft,ungated}` | QGC gating mode |
 | `--quality-reweight {off,sample,pixel}` | MQE reweighting of the unlabeled consistency loss |
@@ -42,3 +44,5 @@ covered by synthetic unit tests (`tests/`).**
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+MambaLiteUNet smokes (`python train.py --ssl`, protocol `--smoke`) require CUDA. The suite skips those smokes when CUDA or `mamba_ssm` is missing. MQE, QGC, and reweight tensor tests do not construct the student and still run.

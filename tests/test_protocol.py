@@ -7,6 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+
 from qamseg.aggregate import aggregate_records, load_metrics_tree, render_csv, render_markdown
 from qamseg.protocol import (
     ABLATION_NAMES,
@@ -15,6 +19,7 @@ from qamseg.protocol import (
     job_argv,
     parse_recipe_names,
 )
+from require_mamba_cuda import skip_unless_mamba_cuda
 
 
 class MatrixTests(unittest.TestCase):
@@ -33,8 +38,10 @@ class MatrixTests(unittest.TestCase):
     def test_ablation_argv_uses_mqe_reweight_without_a_third_network(self):
         jobs = iter_jobs(seeds=(0,), fractions=(10,), recipe_names=("qam-gated-baq-qw", "qam-qw"))
         by_name = {job.recipe: job for job in jobs}
-        stacked = job_argv(by_name["qam-gated-baq-qw"], steps=2, batch_size=2, device="cpu", backbone="tiny", image_size=16, out_dir="out/a")
-        pure = job_argv(by_name["qam-qw"], steps=2, batch_size=2, device="cpu", backbone="tiny", image_size=16, out_dir="out/b")
+        stacked = job_argv(by_name["qam-gated-baq-qw"], steps=2, batch_size=2, device="cuda", backbone="mamba", image_size=32, out_dir="out/a")
+        pure = job_argv(by_name["qam-qw"], steps=2, batch_size=2, device="cuda", backbone="mamba", image_size=32, out_dir="out/b")
+        self.assertEqual(stacked[stacked.index("--ssl-backbone") + 1], "mamba")
+        self.assertEqual(stacked[stacked.index("--ssl-device") + 1], "cuda")
         self.assertIn("--ssl-baq", stacked)
         self.assertIn("--quality-reweight", stacked)
         self.assertEqual(stacked[stacked.index("--quality-reweight") + 1], "sample")
@@ -60,7 +67,7 @@ class AggregateTests(unittest.TestCase):
                     "recipe": "qam-qw",
                     "group": "ablation",
                     "fraction_token": "10",
-                    "backbone": "tiny",
+                    "backbone": "mamba",
                     "data": "synthetic",
                     "eval_split": "synthetic_labeled",
                     "metrics": {
@@ -93,7 +100,7 @@ class AggregateTests(unittest.TestCase):
                     "recipe": "mt",
                     "group": "baseline",
                     "fraction_token": "5",
-                    "backbone": "tiny",
+                    "backbone": "mamba",
                     "data": "synthetic",
                     "eval_split": "synthetic_labeled",
                     "seed": seed,
@@ -136,6 +143,9 @@ class ProtocolScriptTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("qam-gated-baq-qw", completed.stdout)
+            self.assertIn("--ssl-backbone mamba", completed.stdout)
+            self.assertIn("--ssl-device cuda", completed.stdout)
+            self.assertNotIn("TinySegStudent", completed.stdout)
             self.assertIn("Dry run only", completed.stdout)
             manifest = json.loads((Path(tmp) / "protocol_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["seeds"], [0, 1, 2])
@@ -154,6 +164,37 @@ class ProtocolScriptTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("does not download", completed.stdout)
 
+    def test_smoke_without_cuda_exits_before_training(self):
+        import torch
+
+        if torch.cuda.is_available():
+            self.skipTest("CUDA is available; the missing-CUDA exit is not this runner")
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/run_media_protocol.py",
+                    "--smoke",
+                    "--seeds",
+                    "0",
+                    "--fractions",
+                    "10",
+                    "--recipes",
+                    "mt",
+                    "--out-dir",
+                    tmp,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        blob = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 2, blob)
+        self.assertIn("CUDA is not available", blob)
+        self.assertIn("No other student is substituted", blob)
+        self.assertNotIn("gate_keep_fraction:", completed.stdout)
+
+    @skip_unless_mamba_cuda
     def test_smoke_writes_metrics_for_reweight_and_baselines(self):
         with tempfile.TemporaryDirectory() as tmp:
             completed = subprocess.run(

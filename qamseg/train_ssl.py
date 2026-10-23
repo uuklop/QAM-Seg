@@ -1,10 +1,11 @@
 """Quality-aware SSL loop (MQE + QGC + optional QG-CutMix & Prototype QAR).
 
 ``python train.py`` with no flags never imports this module. ``--ssl`` and
-``python -m qamseg.train_ssl`` do. The default run is a few CPU steps on
-synthetic blobs with a tiny conv student, so it does not need a GPU,
-``mamba_ssm``, or ISIC/HAM/PH2. That run checks the wiring. It is not an
-experiment and it does not report a Dice or HD95 result.
+``python -m qamseg.train_ssl`` do. The default run is a few CUDA steps on
+synthetic blobs with MambaLiteUNet. ``mamba_ssm`` selective scan is
+CUDA-only: if CUDA is unavailable the process exits and does not substitute
+another student. That run checks the wiring. It is not an experiment and it
+does not report a Dice or HD95 result. It does not need ISIC/HAM/PH2.
 """
 
 from __future__ import annotations
@@ -53,30 +54,6 @@ from qamseg.qar import (
 from qamseg.qgc import GateConfig, lambda_u_at_step, tau_at_step
 from qamseg.reweight import ReweightConfig, unlabeled_consistency_loss
 from utils import BceDiceLoss
-
-
-class TinySegStudent(nn.Module):
-    """CPU stand-in. Populates ``last_aux`` so feature prototype QAR works on CPU too."""
-
-    def __init__(self):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, 4, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-        )
-        self.head = nn.Conv2d(4, 1, kernel_size=1)
-        self.last_aux: dict = {}
-
-    def forward(self, x):
-        feat = self.stem(x)
-        logits = self.head(feat)
-        probs = torch.sigmoid(logits)
-        self.last_aux = {
-            "logits": logits,
-            "features": feat,
-            "branch_disagreement": None,
-        }
-        return probs
 
 
 def ssl_training_step(
@@ -359,7 +336,36 @@ def _validate_ssl_args(args) -> Optional[str]:
         return "--ssl-pl-threshold must lie in [0, 1]."
     if bool(args.ssl_eval_npy) != bool(args.ssl_eval_mask_npy):
         return "Pass both --ssl-eval-npy and --ssl-eval-mask-npy, or neither."
+    if str(getattr(args, "ssl_backbone", "mamba")) != "mamba":
+        return "--ssl-backbone must be mamba (MambaLiteUNet). No other student is substituted."
+    synthetic = not (
+        args.ssl_unlabeled_npy or args.ssl_labeled_npy or args.ssl_mask_npy or args.ssl_split
+    )
+    if synthetic and int(args.ssl_image_size) < 32:
+        return (
+            "--ssl-image-size must be at least 32 for MambaLiteUNet "
+            "(five stride-2 pools). No other student is substituted."
+        )
     return None
+
+
+def _refuse_unsupported_device(device: str) -> bool:
+    """Stop before building a student when MambaLiteUNet cannot run.
+
+    Selective scan is CUDA-only. A CPU request or a missing GPU exits.
+    Nothing is substituted.
+    """
+    if device == "cpu":
+        print("QAM-Seg: --ssl-device cpu was requested.")
+        print("The SSL student is MambaLiteUNet. mamba_ssm selective scan is CUDA-only.")
+        print("No other student is substituted.")
+        return True
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        print("QAM-Seg: --ssl-device cuda was requested but CUDA is not available.")
+        print("The SSL student is MambaLiteUNet. mamba_ssm selective scan is CUDA-only.")
+        print("No other student is substituted.")
+        return True
+    return False
 
 
 def _metrics_payload(
@@ -433,9 +439,7 @@ def run_from_args(args) -> int:
         return 2
     args = resolve_ssl_method(args)
     device = str(args.ssl_device)
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        print("QAM-Seg: --ssl-device cuda was requested but CUDA is not available.")
-        print("The synthetic smoke path runs on CPU. Re-run with --ssl-device cpu.")
+    if _refuse_unsupported_device(device):
         return 2
 
     synthetic = not (
@@ -463,30 +467,25 @@ def run_from_args(args) -> int:
     if args.use_learned_quality_head:
         print("Learned MQE head flag is set, but the head stays a stub (weight a3 = 0, beta = 0).")
 
-    backbone = str(args.ssl_backbone)
     use_amf = not (bool(getattr(args, "no_amf", False)) or bool(getattr(args, "ablate_amf", False)))
     use_lgfm = not (bool(getattr(args, "no_lgfm", False)) or bool(getattr(args, "ablate_lgfm", False)))
     use_cga = not (bool(getattr(args, "no_cga", False)) or bool(getattr(args, "ablate_cga", False)))
     scan_mode = str(getattr(args, "ssl_scan_mode", "four_way"))
     global_mode = str(getattr(args, "ssl_global_mode", "attn"))
 
-    if backbone == "mamba":
-        try:
-            student = build_mamba_student(
-                use_amf=use_amf,
-                use_lgfm=use_lgfm,
-                use_cga=use_cga,
-                scan_mode=scan_mode,
-                global_mode=global_mode,
-            )
-        except BackboneUnavailable as exc:
-            print(exc)
-            return 2
-        print("Student: MambaLiteUNet. Import succeeded.")
-        print("This is not a CVPR reproduction. Logs from this process are not medical Dice or HD95 results.")
-    else:
-        student = TinySegStudent()
-        print("Student: TinySegStudent.")
+    try:
+        student = build_mamba_student(
+            use_amf=use_amf,
+            use_lgfm=use_lgfm,
+            use_cga=use_cga,
+            scan_mode=scan_mode,
+            global_mode=global_mode,
+        )
+    except BackboneUnavailable as exc:
+        print(exc)
+        return 2
+    print("Student: MambaLiteUNet. Import succeeded.")
+    print("This is not a CVPR reproduction. Logs from this process are not medical Dice or HD95 results.")
 
     if synthetic:
         print("Data: synthetic blobs.")
@@ -598,7 +597,7 @@ def run_from_args(args) -> int:
             result["metrics"],
             synthetic=synthetic,
             eval_split=eval_split,
-            backbone_name="mamba" if backbone == "mamba" else "tiny",
+            backbone_name="mamba",
             teacher_metrics=result.get("teacher_metrics"),
         )
         destination = os.path.join(str(args.ssl_out_dir), "metrics.json")

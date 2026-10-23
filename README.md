@@ -48,9 +48,11 @@ and [LICENSE](LICENSE).
 - `--ssl` runs that path (`python train.py --ssl` or
   `python -m qamseg.train_ssl`). The default is a short CPU smoke on
   synthetic blobs with a tiny student. `--ssl-backbone mamba` uses
-  `MambaLiteUNet` only when that import works; a failed import exits
-  non-zero instead of falling back. `--no-amf`, `--no-lgfm`, and
-  `--no-cga` are still refused.
+  `MambaLiteUNet` only when that import works and `--ssl-device cuda` is
+  set; `mamba_ssm` selective scan is CUDA-only. A failed import, the
+  default CPU device, or CUDA requested but unavailable exits non-zero
+  instead of falling back. `--no-amf`, `--no-lgfm`, and `--no-cga` are
+  still refused.
 - `scripts/make_labeled_fraction_splits.py` writes deterministic 5%/10%/20%
   labeled subsets and complementary unlabeled pools for a local train id
   list or `data_train.npy`. It does not download data. See
@@ -336,7 +338,11 @@ python -m unittest discover -s tests -v
 
 `--ssl-backbone` defaults to `tiny` (`TinySegStudent`, the convolutional
 fallback; there is no separate ConvLiteUNet class). `--ssl-backbone mamba`
-imports `models.MambaLiteUNet` and exits non-zero if the import fails. The split
+imports `models.MambaLiteUNet` and requires `--ssl-device cuda` because
+`mamba_ssm` selective scan is CUDA-only. The default `--ssl-device cpu`,
+or `--ssl-device cuda` when CUDA is unavailable, exits non-zero and does
+not fall back to the tiny student. A failed import exits non-zero the same
+way. `--ssl-backbone tiny` still runs the synthetic CPU smoke. The split
 script writes `splits/<name>/seed<seed>/fraction_{5,10,20}.json` plus CSV
 id lists. Pointing `python train.py --ssl --ssl-split ...` at those files
 requires local train arrays; a missing path exits with an error and does

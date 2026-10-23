@@ -65,7 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--backbone",
         default="tiny",
         choices=("tiny", "mamba"),
-        help="tiny is the CPU conv fallback. mamba is MambaLiteUNet and exits if that import fails.",
+        help=(
+            "tiny is the CPU conv fallback. mamba is MambaLiteUNet, requires "
+            "--device cuda (mamba_ssm selective scan is CUDA-only), and exits "
+            "if that import fails or CUDA is unavailable."
+        ),
     )
     parser.add_argument("--image-size", type=int, default=None, help="Synthetic smoke spatial size. Ignored for .npy arrays.")
     parser.add_argument("--train-npy", default="", help="Local data_train.npy. Refuses val/test names. No download.")

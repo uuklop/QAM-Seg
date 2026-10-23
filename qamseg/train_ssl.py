@@ -15,6 +15,7 @@ import os
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import copy
+import json
 from dataclasses import replace
 from typing import Optional
 
@@ -69,8 +70,8 @@ def ssl_training_step(
     criterion_sup: nn.Module,
     gate: GateConfig,
     lambda_max: float = 1.0,
-    tau0: float = 0.4,
-    tau1: float = 0.8,
+    tau0: float = 0.35,
+    tau1: float = 0.55,
     warm_steps: int = 1,
     ema_alpha: float = 0.99,
     ema_warmup_steps: int = 0,
@@ -268,9 +269,9 @@ def run_ssl_loop(
         optimizer, T_max=max(int(steps), 1), eta_min=lr * 0.01
     )
     # Prevent gate lock-out when --ssl-warm-steps was left at its smoke default (1)
-    # on a multi-step training run (steps >= 10).
+    # on a multi-step training run (steps >= 10). ~30% of the horizon gives MQE q time to rise before tau1.
     effective_warm_steps = (
-        max(1, int(round(0.2 * steps)))
+        max(1, int(round(0.3 * steps)))
         if (int(warm_steps) == 1 and int(steps) >= 10)
         else int(warm_steps)
     )
@@ -368,6 +369,42 @@ def _refuse_unsupported_device(device: str) -> bool:
     return False
 
 
+
+def _gate_stats_from_history(history: list) -> dict:
+    """Summarize per-step gate / quality rows for metrics.json."""
+    if not history:
+        return {
+            "mean_gate_keep": None,
+            "frac_gate_open": None,
+            "frac_steps_gate_open": None,
+            "mean_q": None,
+            "mean_unsup": None,
+            "first_zero_keep_step": None,
+            "tau_end": None,
+        }
+    import math
+    keeps = [float(r.get("gate_keep_fraction", 0.0)) for r in history]
+    qs = [float(r.get("q_mean", float("nan"))) for r in history]
+    unsups = [float(r.get("loss_unsup", r.get("unsup", 0.0))) for r in history]
+    taus = [float(r.get("tau", float("nan"))) for r in history]
+    first_zero = next(
+        (int(r.get("step", i)) for i, r in enumerate(history) if float(r.get("gate_keep_fraction", 1.0)) <= 0.0),
+        None,
+    )
+    qs_ok = [q for q in qs if not math.isnan(q)]
+    frac_open = sum(1 for k in keeps if k > 0.0) / len(keeps)
+    return {
+        "mean_gate_keep": sum(keeps) / len(keeps),
+        "frac_gate_open": frac_open,
+        "frac_steps_gate_open": frac_open,  # alias
+        "mean_q": (sum(qs_ok) / len(qs_ok)) if qs_ok else None,
+        "mean_unsup": sum(unsups) / len(unsups),
+        "first_zero_keep_step": first_zero,
+        "tau_end": taus[-1] if taus else None,
+        "n_steps_logged": len(history),
+    }
+
+
 def _metrics_payload(
     args,
     metrics: dict,
@@ -376,6 +413,7 @@ def _metrics_payload(
     eval_split: str,
     backbone_name: str,
     teacher_metrics: Optional[dict] = None,
+    gate_stats: Optional[dict] = None,
 ) -> dict:
     dice = metrics.get("f1_or_dsc")
     qar_mode = getattr(args, "ssl_qar", "off")
@@ -429,6 +467,15 @@ def _metrics_payload(
             "assd_mean": teacher_metrics.get("assd_mean"),
             "loss": teacher_metrics.get("loss"),
         }
+    payload["tau0"] = float(args.ssl_tau0)
+    payload["tau1"] = float(args.ssl_tau1)
+    payload["warm_steps_requested"] = int(args.ssl_warm_steps)
+    if gate_stats:
+        payload["gate_stats"] = gate_stats
+        # Flat aliases for tables / quick greps
+        payload["mean_gate_keep"] = gate_stats.get("mean_gate_keep")
+        payload["frac_gate_open"] = gate_stats.get("frac_gate_open", gate_stats.get("frac_steps_gate_open"))
+        payload["mean_q"] = gate_stats.get("mean_q")
     return payload
 
 
@@ -592,6 +639,7 @@ def run_from_args(args) -> int:
         print("QAM-Seg: SSL loop produced no steps.")
         return 1
     if args.ssl_out_dir:
+        gate_stats = _gate_stats_from_history(result.get("history") or [])
         payload = _metrics_payload(
             args,
             result["metrics"],
@@ -599,10 +647,32 @@ def run_from_args(args) -> int:
             eval_split=eval_split,
             backbone_name="mamba",
             teacher_metrics=result.get("teacher_metrics"),
+            gate_stats=gate_stats,
         )
         destination = os.path.join(str(args.ssl_out_dir), "metrics.json")
         write_metrics_file(destination, payload)
         print(f"Wrote {destination}")
+        history_path = os.path.join(str(args.ssl_out_dir), "train_log.jsonl")
+        with open(history_path, "w", encoding="utf-8") as handle:
+            for row in result.get("history") or []:
+                serializable = {}
+                for key, value in row.items():
+                    if hasattr(value, "item"):
+                        try:
+                            serializable[key] = float(value.item())
+                            continue
+                        except Exception:
+                            pass
+                    serializable[key] = value if isinstance(value, (int, float, str, bool, type(None))) else str(value)
+                handle.write(json.dumps(serializable) + "\n")
+        print(
+            "gate_stats: "
+            f"mean_keep={gate_stats.get('mean_gate_keep')} "
+            f"frac_open={gate_stats.get('frac_gate_open', gate_stats.get('frac_steps_gate_open'))} "
+            f"mean_q={gate_stats.get('mean_q')} "
+            f"first_zero_keep_step={gate_stats.get('first_zero_keep_step')}"
+        )
+        print(f"Wrote {history_path}")
         print("metrics.json is a wiring record unless a held-out eval array was passed and the run is a real training job.")
     return 0
 

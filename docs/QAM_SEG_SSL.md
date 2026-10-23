@@ -19,7 +19,7 @@ covered by synthetic unit tests (`tests/`).**
    - **Uncancelled Image-Level Quality Scaling (`qamseg/qgc.py`, `qamseg/reweight.py`)**: Fixed the `weights.sum()` denominator bug that canceled out scalar image quality weights $q^\gamma$ when `batch_size == 1` or only one sample passed $q \ge \tau$.
    - **Quality-Guided Feature Prototype Alignment (`qamseg/qar.py`, `--ssl-qar prototype`)**: Replaces the skipped output-probability QAR with a non-collapsing representation-level boundary regularizer (`prototype_quality_regularization`) that pulls ambiguous contour-band student features toward high-reliability teacher foreground/background prototypes.
    - **Quality-Guided CutMix (`qamseg/augment.py`, `--ssl-cutmix`)**: Mixes pairs of unlabeled images and warps teacher pseudo-masks and MQE pixel/image quality weights consistently.
-   - **Adaptive Threshold Warmup & Cosine LR (`qamseg/train_ssl.py`)**: Automatically scales `warm_steps` to `0.2 * steps` on multi-step training runs (`steps >= 10`) when left at the 1-step smoke default, adds `CosineAnnealingLR`, and logs EMA teacher evaluation metrics (`teacher_metrics`).
+   - **Adaptive Threshold Warmup & Cosine LR (`qamseg/train_ssl.py`)**: Default `--ssl-tau0/--ssl-tau1` are `0.35/0.55` on the **MQE q** scale (not pixel confidence); `0.8` locked the image gate shut on ISIC. Automatically scales `warm_steps` to `0.3 * steps` on multi-step training runs (`steps >= 10`) when left at the 1-step smoke default, adds `CosineAnnealingLR`, and logs EMA teacher evaluation metrics (`teacher_metrics`).
 
 ## CLI Summary
 

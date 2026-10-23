@@ -109,9 +109,30 @@ def build_parser():
         ),
     )
     parser.add_argument('--ssl-level', default='both', choices=('image', 'pixel', 'both'))
-    parser.add_argument('--ssl-tau0', type=float, default=0.4)
-    parser.add_argument('--ssl-tau1', type=float, default=0.8)
-    parser.add_argument('--ssl-warm-steps', type=int, default=1)
+    parser.add_argument(
+        '--ssl-tau0',
+        type=float,
+        default=0.35,
+        help='MQE image-quality gate start. Scale is fused MQE q in [0,1], not pixel confidence.',
+    )
+    parser.add_argument(
+        '--ssl-tau1',
+        type=float,
+        default=0.55,
+        help=(
+            'MQE image-quality gate end. Default 0.55 matches typical MQE q (~0.45-0.75). '
+            '0.8 locked the gate shut on ISIC (q rarely reaches 0.8) and collapsed SSL to labeled-only.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-warm-steps',
+        type=int,
+        default=1,
+        help=(
+            'Steps to ramp tau0→tau1. Default 1 is the smoke sentinel; for ssl-steps>=10 '
+            'the loop expands it to ~30% of steps unless set explicitly.'
+        ),
+    )
     parser.add_argument('--ssl-lambda-max', type=float, default=1.0)
     parser.add_argument('--ssl-gamma', type=float, default=1.0)
     parser.add_argument('--ssl-seed', type=int, default=0)

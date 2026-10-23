@@ -6,32 +6,8 @@ with the score taken from the existing MQE estimate. It does not build
 a quality network.
 
 When ``mode`` is ``off`` and no UA-MT / PL baseline is requested, the
-call delegates to ``quality_gated_consistency_loss`` so the previous
-QGC objective is unchanged.
-
-When ``mode`` is ``sample`` or ``pixel``, a ramp ``α(t)`` moves the
-weight from uniform to the detached MQE score:
-
-    w(t) = (1 - α(t)) + α(t) * q
-
-``α`` is the same Gaussian used by ``λ_u`` unless ``ramp`` is
-``linear`` or ``none``. The outer coefficient stays ``λ_u(t) * λ_qw``.
-``λ_qw`` defaults to 1 so an ablation compares weights rather than a
-second scale. QG-SSL published ``λ_qw = 0.25``; pass that explicitly.
-
-Composition with QGC, when reweighting is on:
-
-- ``hard`` / ``gated`` contribute a binary keep (``q >= tau``), not a
-  second factor of ``q``. The continuous score is this reweight.
-- The pixel map (including an optional BAQ edit applied by the caller)
-  stays a spatial weight for ``sample`` mode.
-- ``pixel`` mode owns that spatial map, so it is not multiplied twice.
-- ``soft`` still applies ``q^gamma`` and will stack with this reweight.
-  The MedIA recipes do not combine ``soft`` with reweighting.
-
-UA-MT and confidence-threshold PL are baseline weight masks. They do
-not read MQE. UA-MT here is teacher predictive entropy, not Monte Carlo
-dropout inside MambaLiteUNet.
+call delegates to ``quality_gated_consistency_loss`` so the QGC objective
+is used directly.
 """
 
 from __future__ import annotations
@@ -45,12 +21,18 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from qamseg.mqe import QualityEstimate, as_prob_maps, normalized_entropy
-from qamseg.qgc import GateConfig, GateResult, gate_weights, quality_gated_consistency_loss
+from qamseg.qgc import (
+    GateConfig,
+    GateResult,
+    _image_and_pixel_gate,
+    gate_weights,
+    quality_gated_consistency_loss,
+)
 
 
 @dataclass(frozen=True)
 class ReweightConfig:
-    """Placeholders. Not a tuned MedIA schedule."""
+    """Configuration for MQE reweighting and uncertainty/PL baselines."""
 
     mode: str = "off"
     lambda_qw: float = 1.0
@@ -77,12 +59,7 @@ class ReweightConfig:
 
 
 def qw_alpha(step: int, total_steps: int, ramp: str) -> float:
-    """Ramp in ``[0, 1]``. ``step >= total_steps`` is 1 for gaussian and linear.
-
-    Gaussian matches ``lambda_u_at_step`` without the ``lambda_max`` factor:
-    ``exp(-5 (1 - t/T)^2)``. The training loop passes ``T = max(steps - 1, 1)``
-    so the last optimizer step reaches 1.
-    """
+    """Ramp in ``[0, 1]``. ``step >= total_steps`` is 1 for gaussian and linear."""
     if ramp == "none":
         return 1.0
     if ramp not in ("gaussian", "linear"):
@@ -111,7 +88,8 @@ def _gate_factors(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Image keep ``(B,1,1,1)``, spatial weights, ``q`` ``(B,)``, pixel map.
 
-    Continuous ``q`` is not folded into the image keep for ``hard`` / ``gated``.
+    Continuous ``q`` is not folded into the image keep for ``hard`` / ``gated``
+    when sample/pixel reweighting is active.
     """
     pixel = as_prob_maps(quality.pixel_weight).detach().clamp(0.0, 1.0)
     q = quality.q.detach().float().flatten()
@@ -200,6 +178,8 @@ def _finish(
     lambda_qw: float,
     reduction: str,
     sample_weight: Optional[Tensor] = None,
+    image_w: Optional[Tensor] = None,
+    spatial_w: Optional[Tensor] = None,
 ) -> GateResult:
     weights = weights.to(device=student.device, dtype=student.dtype)
     if weights.shape != student.shape:
@@ -226,8 +206,21 @@ def _finish(
     mean_weight = weights.mean()
 
     if reduction == "normalized":
-        bce_loss = (weights * bce_map).sum() / (weights.sum() + gate.eps)
-        dice_loss = (mass[alive] * (1.0 - dice[alive])).sum() / mass[alive].sum().clamp_min(gate.eps)
+        if image_w is not None and spatial_w is not None:
+            flat_sp = spatial_w.to(device=student.device, dtype=student.dtype).view(batch, -1)
+            sp_mass = flat_sp.sum(dim=1)
+            alive_sp = alive & (sp_mass > 0)
+            img_scale = image_w.to(device=student.device, dtype=student.dtype).view(batch)
+            bce_per_img = (flat_sp[alive_sp] * flat_bce[alive_sp]).sum(dim=1) / sp_mass[alive_sp].clamp_min(gate.eps)
+            inter_sp = (flat_sp[alive_sp] * flat_p[alive_sp] * flat_t[alive_sp]).sum(dim=1)
+            denom_sp = (flat_sp[alive_sp] * flat_p[alive_sp]).sum(dim=1) + (flat_sp[alive_sp] * flat_t[alive_sp]).sum(dim=1)
+            dice_sp = (2.0 * inter_sp + gate.eps) / (denom_sp + gate.eps)
+            num_alive = max(float(int(alive_sp.sum().item())), 1.0)
+            bce_loss = (img_scale[alive_sp] * bce_per_img).sum() / num_alive
+            dice_loss = (img_scale[alive_sp] * (1.0 - dice_sp)).sum() / num_alive
+        else:
+            bce_loss = (weights * bce_map).sum() / (weights.sum() + gate.eps)
+            dice_loss = (mass[alive] * (1.0 - dice[alive])).sum() / mass[alive].sum().clamp_min(gate.eps)
         loss = gate.bce_weight * bce_loss + gate.dice_weight * dice_loss
     elif reduction == "sample":
         if sample_weight is None:
@@ -237,18 +230,19 @@ def _finish(
             raise ValueError(
                 f"sample_weight length {sample_weight.numel()} != batch {batch}"
             )
-        bce_i = torch.zeros(batch, device=student.device, dtype=student.dtype)
-        dice_i = torch.zeros(batch, device=student.device, dtype=student.dtype)
-        bce_i[alive] = (flat_w[alive] * flat_bce[alive]).sum(dim=1) / mass[alive].clamp_min(gate.eps)
-        dice_i[alive] = 1.0 - dice[alive]
+        raw_bce_i = (flat_w * flat_bce).sum(dim=1) / mass.clamp_min(gate.eps)
+        raw_dice_i = 1.0 - dice
+        zeros_b = torch.zeros(batch, device=student.device, dtype=student.dtype)
+        bce_i = torch.where(alive, raw_bce_i, zeros_b)
+        dice_i = torch.where(alive, raw_dice_i, zeros_b)
         per = gate.bce_weight * bce_i + gate.dice_weight * dice_i
         loss = (sample_weight * per).mean() * float(lambda_qw)
         mean_weight = (weights * sample_weight.view(-1, 1, 1, 1)).mean()
     elif reduction == "pixel":
         bce_loss = (weights * bce_map).mean()
         mean_w = flat_w.mean(dim=1)
-        dice_i = torch.zeros(batch, device=student.device, dtype=student.dtype)
-        dice_i[alive] = 1.0 - dice[alive]
+        zeros_b = torch.zeros(batch, device=student.device, dtype=student.dtype)
+        dice_i = torch.where(alive, 1.0 - dice, zeros_b)
         dice_loss = (mean_w * dice_i).mean()
         loss = (gate.bce_weight * bce_loss + gate.dice_weight * dice_loss) * float(lambda_qw)
     else:
@@ -290,15 +284,21 @@ def unlabeled_consistency_loss(
 
     student, teacher, target = _prepare_pair(student_probs, teacher_probs, gate)
     if config.mode == "off" and gate.mode in ("hard", "soft", "gated"):
-        weights = gate_weights(quality, gate).to(device=student.device, dtype=student.dtype)
+        image_w, spatial_w = _image_and_pixel_gate(quality, gate)
+        image_w = image_w.to(device=student.device, dtype=student.dtype)
+        spatial_w = spatial_w.to(device=student.device, dtype=student.dtype)
+        spatial_w = _apply_uncertainty(spatial_w, teacher, config)
+        spatial_w = _apply_pl(spatial_w, teacher, config)
+        weights = (image_w * spatial_w).clamp(0.0, 1.0)
         q = quality.q.detach().float().flatten().to(device=student.device)
         pixel = as_prob_maps(quality.pixel_weight).detach()
     else:
-        image, spatial, q, pixel = _gate_factors(quality, gate, config.mode)
-        weights = (image * spatial).to(device=student.device, dtype=student.dtype)
-
-    weights = _apply_uncertainty(weights, teacher, config)
-    weights = _apply_pl(weights, teacher, config)
+        image_w, spatial_w, q, pixel = _gate_factors(quality, gate, config.mode)
+        image_w = image_w.to(device=student.device, dtype=student.dtype)
+        spatial_w = spatial_w.to(device=student.device, dtype=student.dtype)
+        spatial_w = _apply_uncertainty(spatial_w, teacher, config)
+        spatial_w = _apply_pl(spatial_w, teacher, config)
+        weights = (image_w * spatial_w).clamp(0.0, 1.0)
 
     if config.mode == "off":
         return _finish(
@@ -309,6 +309,8 @@ def unlabeled_consistency_loss(
             alpha=0.0,
             lambda_qw=1.0,
             reduction="normalized",
+            image_w=image_w,
+            spatial_w=spatial_w,
         )
 
     alpha = qw_alpha(step, total_steps, config.ramp)

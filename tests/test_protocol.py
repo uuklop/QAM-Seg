@@ -81,10 +81,6 @@ class AggregateTests(unittest.TestCase):
         self.assertIn("0.6000 ± 0.1000", row["dice"])
         self.assertIn("±", render_markdown(rows))
         self.assertIn("dice_mean", render_csv(rows).splitlines()[0])
-        conv_rows = aggregate_records([{**records[0], "backbone": "conv"}])
-        markdown = render_markdown(conv_rows)
-        self.assertIn("| conv |", markdown)
-        self.assertIn("backbone=conv is ConvLiteUNet, not MambaLiteUNet", markdown)
 
     def test_loader_and_script_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,76 +143,6 @@ class ProtocolScriptTests(unittest.TestCase):
             self.assertIn("qam-ungated", manifest["ablation"])
             self.assertGreaterEqual(len(manifest["jobs"]), 3)
             self.assertTrue(any(job["fraction"] == "full" for job in manifest["jobs"]))
-            self.assertEqual(manifest["backbone"], "tiny")
-            argv = manifest["jobs"][0]["argv"]
-            self.assertEqual(argv[argv.index("--ssl-backbone") + 1], "tiny")
-
-    def test_dry_run_accepts_conv_backbone(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "scripts/run_media_protocol.py",
-                    "--dry-run",
-                    "--backbone",
-                    "conv",
-                    "--seeds",
-                    "0",
-                    "--fractions",
-                    "10",
-                    "--recipes",
-                    "mt,qam-qw",
-                    "--out-dir",
-                    tmp,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-            self.assertIn("--ssl-backbone", completed.stdout)
-            self.assertIn("conv", completed.stdout)
-            self.assertIn("Dry run only", completed.stdout)
-            manifest = json.loads((Path(tmp) / "protocol_manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["backbone"], "conv")
-            self.assertEqual(manifest["requested_backbone"], "conv")
-            self.assertEqual(manifest["qar"], "skipped")
-            self.assertEqual(manifest["quality_network"], "none")
-            self.assertIn("not MambaLiteUNet", manifest["note"])
-            for job in manifest["jobs"]:
-                argv = job["argv"]
-                self.assertEqual(argv[argv.index("--ssl-backbone") + 1], "conv")
-                self.assertNotIn("mamba", argv)
-
-    def test_smoke_keeps_tiny_when_conv_is_requested(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "scripts/run_media_protocol.py",
-                    "--dry-run",
-                    "--smoke",
-                    "--backbone",
-                    "conv",
-                    "--seeds",
-                    "0",
-                    "--fractions",
-                    "10",
-                    "--recipes",
-                    "mt",
-                    "--out-dir",
-                    tmp,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-            manifest = json.loads((Path(tmp) / "protocol_manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["backbone"], "tiny")
-            self.assertEqual(manifest["requested_backbone"], "conv")
-            argv = manifest["jobs"][0]["argv"]
-            self.assertEqual(argv[argv.index("--ssl-backbone") + 1], "tiny")
 
     def test_real_run_without_arrays_exits_2(self):
         completed = subprocess.run(

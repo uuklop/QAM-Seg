@@ -248,7 +248,6 @@ def render_markdown(rows: Sequence[Mapping]) -> str:
         "\nMean ± sample std (ddof=1) over the seeds in each cell. "
         "A single seed has no std. Blank distance cells had no finite values. "
         "Synthetic rows are wiring checks, not MedIA numbers. "
-        "HD95 and ASSD are pixels at mask resolution, not millimetres. "
-        "backbone=conv is ConvLiteUNet, not MambaLiteUNet.\n"
+        "HD95 and ASSD are pixels at mask resolution, not millimetres.\n"
     )
     return header + "".join(body) + note

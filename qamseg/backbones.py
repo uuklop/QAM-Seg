@@ -1,17 +1,16 @@
 """SSL student factory.
 
 ``tiny`` is ``TinySegStudent``, the CPU convolutional fallback used by the
-default smoke path. ``conv`` is ``models.ConvLiteUNet``, a capacity-matched
-CNN stand-in with the same ``c_list`` and U-Net depth. It does not import
-``mamba_ssm`` and it is not MambaLiteUNet. ``mamba`` constructs
-``models.MambaLiteUNet`` when that import succeeds. A failed import is
-reported and is fatal only when ``mamba`` was requested; ConvLite is not
-substituted for it. The supervised ``python train.py`` path does not use
-this module. MambaLiteUNet is the paper backbone, not a second quality model.
+default smoke path. There is no separate ConvLiteUNet module. ``mamba``
+constructs ``models.MambaLiteUNet`` when that import succeeds. A failed import
+is reported and is fatal only when ``mamba`` was requested. The supervised
+``python train.py`` path does not use this module. MambaLiteUNet is the
+backbone, not a second quality model.
 """
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -33,25 +32,6 @@ class BackboneUnavailable(Exception):
             f"Reason: {type(self.cause).__name__}: {self.cause}\n"
             "The tiny conv student was not substituted, because this backbone was explicitly requested.\n"
             "Re-run with the default (omit --ssl-backbone, or pass --ssl-backbone tiny).\n"
-            "This process does not install packages and does not download datasets.\n"
-            "A successful import is still not a medical training run and does not report CVPR Dice or HD95."
-        )
-
-
-class ConvLiteUnavailable(Exception):
-    """``--ssl-backbone conv`` was requested and the class did not construct."""
-
-    def __init__(self, cause: BaseException):
-        self.cause = cause
-        super().__init__(self.format_message())
-
-    def format_message(self) -> str:
-        return (
-            "QAM-Seg: --ssl-backbone conv was requested, but models.ConvLiteUNet "
-            "could not be imported or constructed.\n"
-            f"Reason: {type(self.cause).__name__}: {self.cause}\n"
-            "The tiny student was not substituted, because this backbone was explicitly requested.\n"
-            "MambaLiteUNet was not substituted either. ConvLiteUNet is not Mamba.\n"
             "This process does not install packages and does not download datasets.\n"
             "A successful import is still not a medical training run and does not report CVPR Dice or HD95."
         )
@@ -81,42 +61,44 @@ def import_mamba_lite_unet():
     return MambaLiteUNet
 
 
-def build_mamba_student(importer=None):
-    """Construct MambaLiteUNet with the config ``c_list``.
+def build_mamba_student(
+    importer=None,
+    *,
+    use_amf: bool = True,
+    use_lgfm: bool = True,
+    use_cga: bool = True,
+    scan_mode: str = "four_way",
+    global_mode: str = "attn",
+):
+    """Construct MambaLiteUNet with the config ``c_list`` and optional ablation flags.
 
-    The forward in this tree already applies ``sigmoid``. Callers that asked
-    for this backbone should let ``BackboneUnavailable`` stop the process.
+    Inspects the constructor signature so simple mock classes in unit tests
+    that only accept ``(num_classes, input_channels, c_list)`` continue to work.
     """
     load = importer or import_mamba_lite_unet
     try:
         cls = load()
-        return cls(num_classes=1, input_channels=3, c_list=read_c_list())
+        kwargs = {
+            "num_classes": 1,
+            "input_channels": 3,
+            "c_list": read_c_list(),
+        }
+        try:
+            sig = inspect.signature(cls)
+            optional = {
+                "use_amf": bool(use_amf),
+                "use_lgfm": bool(use_lgfm),
+                "use_cga": bool(use_cga),
+                "scan_mode": str(scan_mode),
+                "global_mode": str(global_mode),
+            }
+            for key, value in optional.items():
+                if key in sig.parameters:
+                    kwargs[key] = value
+        except (TypeError, ValueError):
+            pass
+        return cls(**kwargs)
     except BackboneUnavailable:
         raise
     except Exception as exc:
         raise BackboneUnavailable(exc) from exc
-
-
-def import_conv_lite_unet():
-    """Import the CNN stand-in. This module does not import ``mamba_ssm``."""
-    from models.ConvLiteUNet import ConvLiteUNet
-
-    return ConvLiteUNet
-
-
-def build_conv_student(importer=None):
-    """Construct ConvLiteUNet with the config ``c_list``.
-
-    The forward applies ``sigmoid``, same contract as the other SSL students.
-    This is not MambaLiteUNet. Callers that asked for ``conv`` should let
-    ``ConvLiteUnavailable`` stop the process instead of swapping in ``tiny``
-    or ``mamba``.
-    """
-    load = importer or import_conv_lite_unet
-    try:
-        cls = load()
-        return cls(num_classes=1, input_channels=3, c_list=read_c_list())
-    except ConvLiteUnavailable:
-        raise
-    except Exception as exc:
-        raise ConvLiteUnavailable(exc) from exc

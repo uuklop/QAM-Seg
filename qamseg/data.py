@@ -86,9 +86,20 @@ def _circle_mask(size: int, cy: int, cx: int, radius: int) -> Tensor:
 
 
 class ArrayImageDataset(Dataset):
-    """In-memory images, optional masks. Images are ``(N, C, H, W)`` float."""
+    """In-memory images, optional masks. Images are ``(N, C, H, W)`` float.
 
-    def __init__(self, images: Tensor, masks: Optional[Tensor] = None):
+    When ``augment=True``, applies random 90-degree rotations and flips to
+    ``(image, mask)`` pairs (or ``image`` alone) using a seeded generator.
+    """
+
+    def __init__(
+        self,
+        images: Tensor,
+        masks: Optional[Tensor] = None,
+        *,
+        augment: bool = False,
+        seed: int = 0,
+    ):
         if images.ndim != 4:
             raise ValueError(f"images must be NCHW, got shape {tuple(images.shape)}")
         self.images = images.float()
@@ -97,15 +108,36 @@ class ArrayImageDataset(Dataset):
             raise ValueError(
                 f"mask count {self.masks.shape[0]} != image count {self.images.shape[0]}"
             )
+        self.augment = bool(augment)
+        self.seed = int(seed)
+        self._call_count = 0
 
     def __len__(self) -> int:
         return int(self.images.shape[0])
 
     def __getitem__(self, index: int):
         image = self.images[index]
-        if self.masks is None:
+        mask = None if self.masks is None else self.masks[index]
+        if self.augment:
+            gen = torch.Generator()
+            gen.manual_seed(self.seed * 100003 + int(index) * 97 + self._call_count)
+            self._call_count += 1
+            k = int(torch.randint(0, 4, (1,), generator=gen).item())
+            if k > 0:
+                image = torch.rot90(image, k, dims=(-2, -1))
+                if mask is not None:
+                    mask = torch.rot90(mask, k, dims=(-2, -1))
+            if bool(torch.randint(0, 2, (1,), generator=gen).item()):
+                image = torch.flip(image, dims=(-1,))
+                if mask is not None:
+                    mask = torch.flip(mask, dims=(-1,))
+            if bool(torch.randint(0, 2, (1,), generator=gen).item()):
+                image = torch.flip(image, dims=(-2,))
+                if mask is not None:
+                    mask = torch.flip(mask, dims=(-2,))
+        if mask is None:
             return image
-        return image, self.masks[index]
+        return image, mask
 
 
 def _to_nchw(array: np.ndarray) -> Tensor:
@@ -193,7 +225,14 @@ def load_eval_arrays(image_path: str, mask_path: str) -> tuple[Tensor, Tensor]:
     return _read_image_mask_files(image_path, mask_path)
 
 
-def datasets_from_split(image_path: str, mask_path: str, split_path: str) -> tuple[Dataset, Dataset]:
+def datasets_from_split(
+    image_path: str,
+    mask_path: str,
+    split_path: str,
+    *,
+    augment_labeled: bool = False,
+    seed: int = 0,
+) -> tuple[Dataset, Dataset]:
     """Slice a local train pair with a ``fraction_*.json`` file.
 
     Unlabeled rows are returned as images only. The split must be a partition
@@ -214,7 +253,12 @@ def datasets_from_split(image_path: str, mask_path: str, split_path: str) -> tup
             "The complement of the labeled subset is empty, so there is nothing to train on. "
             + UNLABELED_TODO
         )
-    labeled = ArrayImageDataset(images[labeled_rows], masks[labeled_rows])
+    labeled = ArrayImageDataset(
+        images[labeled_rows],
+        masks[labeled_rows],
+        augment=augment_labeled,
+        seed=seed,
+    )
     unlabeled = ArrayImageDataset(images[unlabeled_rows], masks=None)
     return labeled, unlabeled
 
@@ -227,6 +271,7 @@ def build_ssl_datasets(
     labeled_npy: str = "",
     mask_npy: str = "",
     split_json: str = "",
+    augment_labeled: bool = False,
 ) -> tuple[Dataset, Dataset]:
     """Synthetic datasets by default.
 
@@ -247,12 +292,20 @@ def build_ssl_datasets(
                 "Pass --ssl-labeled-npy and --ssl-mask-npy with --ssl-split. "
                 "Missing paths are an error. " + UNLABELED_TODO
             )
-        return datasets_from_split(labeled_npy, mask_npy, split_json)
+        return datasets_from_split(
+            labeled_npy,
+            mask_npy,
+            split_json,
+            augment_labeled=augment_labeled,
+            seed=seed,
+        )
     if labeled_npy or mask_npy:
         if not labeled_npy or not mask_npy:
             raise ValueError("Pass both --ssl-labeled-npy and --ssl-mask-npy, or neither.")
         images, masks = load_labeled_arrays(labeled_npy, mask_npy)
-        labeled: Dataset = ArrayImageDataset(images, masks)
+        labeled: Dataset = ArrayImageDataset(
+            images, masks, augment=augment_labeled, seed=seed
+        )
     else:
         labeled = SyntheticLesionDataset(length=length, size=size, labeled=True, seed=seed)
 
@@ -273,16 +326,22 @@ def build_dual_loaders(
     unlabeled: Dataset,
     batch_size: int = 2,
     shuffle: bool = False,
+    seed: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
     """Two loaders. ``num_workers=0`` so the smoke path needs no fork."""
     if batch_size < 1:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+    gen_l = torch.Generator()
+    gen_l.manual_seed(int(seed))
+    gen_u = torch.Generator()
+    gen_u.manual_seed(int(seed) + 997)
     labeled_loader = DataLoader(
         labeled,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=0,
         drop_last=True,
+        generator=gen_l if shuffle else None,
     )
     unlabeled_loader = DataLoader(
         unlabeled,
@@ -290,6 +349,7 @@ def build_dual_loaders(
         shuffle=shuffle,
         num_workers=0,
         drop_last=True,
+        generator=gen_u if shuffle else None,
     )
     return labeled_loader, unlabeled_loader
 
@@ -298,19 +358,29 @@ def iter_dual_batches(
     labeled_loader: Sequence,
     unlabeled_loader: Sequence,
 ) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
-    """Yield ``(x_l, y_l, x_u)`` by cycling the unlabeled loader.
+    """Yield ``(x_l, y_l, x_u)`` across the full span of the larger loader.
 
-    The shorter last batch is trimmed so the two sides share a batch size.
-    An empty unlabeled loader raises; it does not invent images.
+    Fixes the unlabeled starvation bug where iterating only over
+    ``labeled_loader`` truncated each pass to ``len(labeled_loader)`` steps
+    and discarded the remaining 80%–95% of ``unlabeled_loader``. Now runs
+    ``max(len(labeled_loader), len(unlabeled_loader))`` steps per epoch,
+    cycling whichever loader is shorter.
     """
     if len(unlabeled_loader) == 0:
         raise ValueError(f"Unlabeled loader is empty. {UNLABELED_TODO}")
     if len(labeled_loader) == 0:
         raise ValueError("Labeled loader is empty.")
+    total_batches = max(len(labeled_loader), len(unlabeled_loader))
+    labeled_cycle = itertools.cycle(labeled_loader)
     unlabeled_cycle = itertools.cycle(unlabeled_loader)
-    for labeled_batch in labeled_loader:
+    for _ in range(total_batches):
+        labeled_batch = next(labeled_cycle)
         unlabeled_batch = next(unlabeled_cycle)
         images_l, masks_l = labeled_batch
-        images_u = unlabeled_batch[0] if isinstance(unlabeled_batch, (tuple, list)) else unlabeled_batch
+        images_u = (
+            unlabeled_batch[0]
+            if isinstance(unlabeled_batch, (tuple, list))
+            else unlabeled_batch
+        )
         count = min(int(images_l.shape[0]), int(images_u.shape[0]))
         yield images_l[:count], masks_l[:count], images_u[:count]

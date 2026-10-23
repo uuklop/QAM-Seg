@@ -3,9 +3,9 @@
 ``python train.py`` with no flags does not enter SSL. ``--ssl`` dispatches
 to ``qamseg.train_ssl`` before the supervised stack is imported.
 
-``--no-amf``, ``--no-lgfm``, and ``--no-cga`` stay refused. Those bypasses
-are not wired, and turning them on would change the supervised baseline
-without a matching forward.
+``--no-amf``, ``--no-lgfm``, and ``--no-cga`` stay refused unless
+``--allow-ablation`` is also passed (or use ``--ablate-amf``,
+``--ablate-lgfm``, ``--ablate-cga`` on the SSL path).
 """
 
 import argparse
@@ -24,7 +24,7 @@ def build_parser():
         description=(
             'Supervised MambaLiteUNet training used as the QAM-Seg backbone. '
             '--ssl runs the quality-aware SSL path (synthetic CPU smoke by default). '
-            'Ablation flags are still refused.'
+            'Ablation flags are still refused unless --allow-ablation is set.'
         ),
     )
     parser.add_argument(
@@ -38,17 +38,49 @@ def build_parser():
     parser.add_argument(
         '--no-amf',
         action='store_true',
-        help='Reserved ablation. Does not bypass Adaptive Multi-branch Mamba Feature Fusion.',
+        help='Reserved ablation flag (requires --allow-ablation or scripts/count_params_flops.py).',
     )
     parser.add_argument(
         '--no-lgfm',
         action='store_true',
-        help='Reserved ablation. Does not bypass Local-Global Feature Mixing.',
+        help='Reserved ablation flag (requires --allow-ablation or scripts/count_params_flops.py).',
     )
     parser.add_argument(
         '--no-cga',
         action='store_true',
-        help='Reserved ablation. Does not bypass Cross-Gated Attention.',
+        help='Reserved ablation flag (requires --allow-ablation or scripts/count_params_flops.py).',
+    )
+    parser.add_argument(
+        '--allow-ablation',
+        action='store_true',
+        help='Permit --no-amf, --no-lgfm, and --no-cga to configure MambaLiteUNet ablations.',
+    )
+    parser.add_argument(
+        '--ablate-amf',
+        action='store_true',
+        help='Bypass Adaptive Multi-branch Mamba Feature Fusion in MambaLiteUNet.',
+    )
+    parser.add_argument(
+        '--ablate-lgfm',
+        action='store_true',
+        help='Bypass Local-Global Feature Mixing in MambaLiteUNet.',
+    )
+    parser.add_argument(
+        '--ablate-cga',
+        action='store_true',
+        help='Bypass Cross-Gated Attention in MambaLiteUNet.',
+    )
+    parser.add_argument(
+        '--ssl-scan-mode',
+        default='four_way',
+        choices=('four_way', 'unidirectional'),
+        help='2D scan mode for MambaLiteUNet branches (default: four_way).',
+    )
+    parser.add_argument(
+        '--ssl-global-mode',
+        default='attn',
+        choices=('attn', 'spectral'),
+        help='Global branch inside LGFM: attn (MultiheadAttention) or spectral (2D FFT).',
     )
     parser.add_argument('--ssl-steps', type=int, default=2, help='SSL optimizer steps. Default is a smoke length.')
     parser.add_argument('--ssl-device', default='cpu', choices=('cpu', 'cuda'))
@@ -93,11 +125,9 @@ def build_parser():
     parser.add_argument(
         '--ssl-backbone',
         default='tiny',
-        choices=('tiny', 'conv', 'mamba'),
+        choices=('tiny', 'mamba'),
         help=(
-            'SSL student. tiny (default) is the CPU smoke stand-in. '
-            'conv is models.ConvLiteUNet, a capacity-matched CNN fallback that does not '
-            'import mamba_ssm and must not be reported as Mamba. '
+            'SSL student. tiny (default) is the CPU conv stand-in. '
             'mamba imports models.MambaLiteUNet and exits non-zero if that import fails. '
             'Ignored unless --ssl is set. Not a CVPR run.'
         ),
@@ -111,6 +141,26 @@ def build_parser():
         '--ssl-baq',
         action='store_true',
         help='Multiply pixel weights by the optional boundary-aware prior. Off by default.',
+    )
+    parser.add_argument(
+        '--ssl-cutmix',
+        action='store_true',
+        help='Apply Quality-Guided CutMix across unlabeled batches when batch_size >= 2.',
+    )
+    parser.add_argument(
+        '--ssl-qar',
+        default='off',
+        choices=('off', 'prototype'),
+        help=(
+            'Quality-aware regularizer mode. off (default) skips QAR. '
+            'prototype enables Quality-Guided Feature Prototype Alignment (QG-PA) on boundary features.'
+        ),
+    )
+    parser.add_argument(
+        '--ssl-lambda-qar',
+        type=float,
+        default=0.1,
+        help='Weight on the prototype QAR term when --ssl-qar prototype is active.',
     )
     parser.add_argument(
         '--quality-reweight',
@@ -208,12 +258,16 @@ def build_parser():
 def parse_train_args(argv=None):
     """Return (args, unknown, reserved_names).
 
-    `reserved_names` lists ablation flags that were actually passed.
+    `reserved_names` lists ablation flags that were actually passed without
+    `--allow-ablation`.
     `unknown` is ignored so extra tokens do not change the supervised run.
     """
     parser = build_parser()
     args, unknown = parser.parse_known_args(argv)
-    reserved = [flag for attr, flag, _reason in RESERVED_FLAGS if getattr(args, attr)]
+    if getattr(args, 'allow_ablation', False):
+        reserved = []
+    else:
+        reserved = [flag for attr, flag, _reason in RESERVED_FLAGS if getattr(args, attr)]
     return args, unknown, reserved
 
 
@@ -233,6 +287,8 @@ def resolve_ssl_method(args):
     resolved.ssl_gate = 'ungated'
     resolved.quality_reweight = 'off'
     resolved.ssl_baq = False
+    resolved.ssl_cutmix = False
+    resolved.ssl_qar = 'off'
     resolved.ssl_uncertainty = 'off'
     resolved.ssl_pl_threshold = 0.0
     if method == 'mt':
@@ -252,13 +308,13 @@ def resolve_ssl_method(args):
 
 
 def refuse_reserved_flags(reserved):
-    """Exit 2 when an ablation flag was passed. No-op otherwise."""
+    """Exit 2 when an ablation flag was passed without --allow-ablation."""
     if not reserved:
         return
     reasons = {flag: reason for _attr, flag, reason in RESERVED_FLAGS}
     print('QAM-Seg: ablation flags are scaffolds only and are not wired into training.')
-    print('The supervised MambaLiteUNet path is unchanged if you omit them.')
-    print('--ssl is separate and does not enable these bypasses.')
+    print('Pass --allow-ablation (or --ablate-amf / --ablate-lgfm / --ablate-cga) to enable them.')
+    print('--ssl is separate and does not enable these bypasses without --allow-ablation.')
     print('See docs/QAM_SEG_SSL.md.')
     for flag in reserved:
         print(f'  {flag}: {reasons[flag]}')

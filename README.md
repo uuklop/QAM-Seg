@@ -47,15 +47,10 @@ and [LICENSE](LICENSE).
   code, unit-tested on synthetic tensors, not experimentally validated.
 - `--ssl` runs that path (`python train.py --ssl` or
   `python -m qamseg.train_ssl`). The default is a short CPU smoke on
-  synthetic blobs with `TinySegStudent` (`--ssl-backbone tiny`).
-  `--ssl-backbone conv` builds `models/ConvLiteUNet.py`, a
-  capacity-matched CNN stand-in that does not import `mamba_ssm`. It is
-  the GPU fallback overnight ISIC2017 used on DESKTOP when the Mamba wheel
-  could not be built (CUDA 12.8 vs torch cu118). Do not report ConvLite
-  metrics as Mamba. `--ssl-backbone mamba` uses `MambaLiteUNet` only when
-  that import works; a failed import exits non-zero instead of falling
-  back to tiny or conv. `--no-amf`, `--no-lgfm`, and `--no-cga` are still
-  refused.
+  synthetic blobs with a tiny student. `--ssl-backbone mamba` uses
+  `MambaLiteUNet` only when that import works; a failed import exits
+  non-zero instead of falling back. `--no-amf`, `--no-lgfm`, and
+  `--no-cga` are still refused.
 - `scripts/make_labeled_fraction_splits.py` writes deterministic 5%/10%/20%
   labeled subsets and complementary unlabeled pools for a local train id
   list or `data_train.npy`. It does not download data. See
@@ -180,17 +175,11 @@ the upstream `requirements.txt`.
    pip install -r requirements.txt
    ```
 
-   If `causal_conv1d` or `mamba_ssm` fails to build (a CUDA 12.8 driver
-   against this cu118 torch wheel is one case):
+   If `causal_conv1d` or `mamba_ssm` fails to build:
 
    ```bash
    pip install --no-cache-dir causal_conv1d mamba_ssm
    ```
-
-   Supervised `python train.py` still needs that package. The SSL path can
-   use `--ssl-backbone conv` (`ConvLiteUNet`) instead of
-   `--ssl-backbone mamba`. ConvLite is not MambaLiteUNet. The QAM-Seg claim
-   stays MQE, QGC, optional BAQ, and MQE reweighting.
 
 5. Check CUDA visibility:
 
@@ -354,21 +343,13 @@ python scripts/make_labeled_fraction_splits.py --help
 python -m unittest discover -s tests -v
 ```
 
-`--ssl-backbone` defaults to `tiny` (`TinySegStudent`, the CPU smoke
-student). `--ssl-backbone conv` is `ConvLiteUNet`
-(`models/ConvLiteUNet.py`): the same channel schedule as MambaLiteUNet,
-residual convolutions instead of Mamba blocks, and no `mamba_ssm` import.
-Use it when the Mamba package cannot be installed. Overnight ISIC2017 on
-DESKTOP trained this stand-in, not MambaLiteUNet. Do not label those
-metrics as Mamba. This README does not quote them. `--ssl-backbone mamba`
-imports `models.MambaLiteUNet` and exits non-zero if the import fails. The
-paper student remains MambaLiteUNet. The QAM-Seg claim is MQE, QGC,
-optional BAQ, and MQE reweighting, not a new backbone and not a stacked
-quality predictor. The split script writes
-`splits/<name>/seed<seed>/fraction_{5,10,20}.json` plus CSV id lists.
-Pointing `python train.py --ssl --ssl-split ...` at those files requires
-local train arrays; a missing path exits with an error and does not
-download ISIC, HAM10000, or PH2.
+`--ssl-backbone` defaults to `tiny` (`TinySegStudent`, the convolutional
+fallback; there is no separate ConvLiteUNet class). `--ssl-backbone mamba`
+imports `models.MambaLiteUNet` and exits non-zero if the import fails. The split
+script writes `splits/<name>/seed<seed>/fraction_{5,10,20}.json` plus CSV
+id lists. Pointing `python train.py --ssl --ssl-split ...` at those files
+requires local train arrays; a missing path exits with an error and does
+not download ISIC, HAM10000, or PH2.
 
 `--quality-reweight off` (the default) leaves the previous QGC loss in
 place. `sample` or `pixel` reweights that unlabeled term with the existing

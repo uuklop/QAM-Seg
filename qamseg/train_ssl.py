@@ -1,20 +1,10 @@
-"""Quality-aware SSL loop (MQE + QGC).
+"""Quality-aware SSL loop (MQE + QGC + optional QG-CutMix & Prototype QAR).
 
 ``python train.py`` with no flags never imports this module. ``--ssl`` and
 ``python -m qamseg.train_ssl`` do. The default run is a few CPU steps on
 synthetic blobs with a tiny conv student, so it does not need a GPU,
 ``mamba_ssm``, or ISIC/HAM/PH2. That run checks the wiring. It is not an
 experiment and it does not report a Dice or HD95 result.
-
-The step itself takes any student that maps ``(B, 3, H, W)`` to a sigmoid
-mask ``(B, 1, H, W)``. ``--ssl-backbone mamba`` builds
-``models.MambaLiteUNet`` when that import works and exits if it does not.
-``--ssl-backbone conv`` builds ``models.ConvLiteUNet``, a capacity-matched
-CNN stand-in that does not import ``mamba_ssm``. That student is not
-MambaLiteUNet and its logs must not be reported as Mamba metrics. The
-default remains ``TinySegStudent``. A prepared split is optional and only
-indexes local arrays; this module still does not download medical data or
-report a dataset Dice or HD95.
 """
 
 from __future__ import annotations
@@ -32,8 +22,13 @@ import torch
 from torch import nn
 
 from qamseg.aggregate import write_metrics_file
-from qamseg.augment import strong_augment, weak_augment
-from qamseg.backbones import BackboneUnavailable, ConvLiteUnavailable, build_conv_student, build_mamba_student
+from qamseg.augment import (
+    augment_labeled_batch,
+    quality_guided_cutmix,
+    strong_augment,
+    weak_augment,
+)
+from qamseg.backbones import BackboneUnavailable, build_mamba_student
 from qamseg.cli import parse_train_args, refuse_reserved_flags, resolve_ssl_method
 from qamseg.data import (
     ArrayImageDataset,
@@ -43,28 +38,45 @@ from qamseg.data import (
     load_eval_arrays,
 )
 from qamseg.ema import ema_update
-from qamseg.metrics import _distance_pair, binary_pixel_metrics, format_eval_log, format_ssl_log
+from qamseg.metrics import (
+    _distance_pair,
+    binary_pixel_metrics,
+    format_eval_log,
+    format_ssl_log,
+)
 from qamseg.mqe import apply_boundary_aware_prior, estimate_quality, gradient_magnitude
-from qamseg.qar import QAR_REASON, QAR_STATUS
+from qamseg.qar import (
+    QAR_REASON,
+    QAR_STATUS,
+    prototype_quality_regularization,
+)
 from qamseg.qgc import GateConfig, lambda_u_at_step, tau_at_step
 from qamseg.reweight import ReweightConfig, unlabeled_consistency_loss
 from utils import BceDiceLoss
 
 
 class TinySegStudent(nn.Module):
-    """CPU stand-in. Not MambaLiteUNet and not a source of benchmark scores."""
+    """CPU stand-in. Populates ``last_aux`` so feature prototype QAR works on CPU too."""
 
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
+        self.stem = nn.Sequential(
             nn.Conv2d(3, 4, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(4, 1, kernel_size=1),
-            nn.Sigmoid(),
         )
+        self.head = nn.Conv2d(4, 1, kernel_size=1)
+        self.last_aux: dict = {}
 
     def forward(self, x):
-        return self.net(x)
+        feat = self.stem(x)
+        logits = self.head(feat)
+        probs = torch.sigmoid(logits)
+        self.last_aux = {
+            "logits": logits,
+            "features": feat,
+            "branch_disagreement": None,
+        }
+        return probs
 
 
 def ssl_training_step(
@@ -93,13 +105,19 @@ def ssl_training_step(
     uncertainty: str = "off",
     uncertainty_tau: float = 0.75,
     pl_threshold: float = 0.0,
+    use_cutmix: bool = False,
+    qar_mode: str = "off",
+    lambda_qar: float = 0.1,
+    augment_labeled: bool = False,
+    seed: int = 0,
+    scheduler=None,
 ) -> dict:
-    """One labeled step plus one quality-gated unlabeled step.
-
-    The teacher and the weak-view student forward used by MQE are
-    stop-grad. The strong-view student prediction is what QGC trains.
-    """
+    """One labeled step plus one quality-gated unlabeled step."""
     student.train()
+    if augment_labeled:
+        labeled_images, labeled_masks = augment_labeled_batch(
+            labeled_images, labeled_masks, step=step, seed=seed
+        )
     pred_labeled = student(labeled_images)
     loss_sup = criterion_sup(pred_labeled, labeled_masks)
 
@@ -107,25 +125,47 @@ def ssl_training_step(
     view_strong = strong_augment(unlabeled_images, noise_std=noise_std)
     with torch.no_grad():
         teacher_weak = teacher(view_weak)
+        teacher_aux = getattr(teacher, "last_aux", None) or {}
+        mamba_disagreement = teacher_aux.get("branch_disagreement")
         student_weak = student(view_weak)
     pred_strong = student(view_strong)
+    student_aux = getattr(student, "last_aux", None) or {}
+    student_strong_features = student_aux.get("features")
 
     quality = estimate_quality(
         teacher_weak,
         student_probs=student_weak,
         view_probs=pred_strong.detach(),
+        mamba_disagreement=mamba_disagreement,
     )
     if use_baq:
         grad = gradient_magnitude(view_weak)
+        # Use (1 - entropy) as the boundary quality factor rather than passing
+        # pixel_weight twice (which previously caused quadratic self-damping).
+        baq_quality = (
+            (1.0 - quality.entropy)
+            if quality.entropy is not None
+            else quality.pixel_weight
+        )
         quality.pixel_weight = apply_boundary_aware_prior(
             quality.pixel_weight,
             grad,
-            quality.pixel_weight,
+            baq_quality,
         )
 
+    if use_cutmix and unlabeled_images.shape[0] >= 2:
+        view_strong, teacher_weak, quality = quality_guided_cutmix(
+            view_strong,
+            teacher_weak,
+            quality,
+            step=step,
+            seed=seed,
+        )
+        pred_strong = student(view_strong)
+        student_aux = getattr(student, "last_aux", None) or {}
+        student_strong_features = student_aux.get("features")
+
     tau = tau_at_step(step, tau0, tau1, warm_steps)
-    # The last optimizer step is t = T, so a run of N steps reaches lambda_max
-    # on step N-1. Step 0 stays at the foot of the Gaussian ramp.
     horizon = max(int(total_steps) - 1, 1)
     lam = lambda_u_at_step(step, horizon, lambda_max)
     reweight = ReweightConfig(
@@ -136,8 +176,8 @@ def ssl_training_step(
         uncertainty_tau=float(uncertainty_tau),
         pl_threshold=float(pl_threshold),
     )
+    qar_value = 0.0
     if lam == 0.0:
-        # Supervised preset. The unlabeled view is not part of the objective.
         loss = loss_sup
         unsup_value = 0.0
         keep_fraction = 0.0
@@ -154,6 +194,14 @@ def ssl_training_step(
             total_steps=horizon,
         )
         loss = loss_sup + lam * gated.loss
+        if qar_mode == "prototype" and student_strong_features is not None and float(lambda_qar) > 0:
+            loss_qar = prototype_quality_regularization(
+                student_strong_features,
+                teacher_weak,
+                quality,
+            )
+            loss = loss + lam * float(lambda_qar) * loss_qar
+            qar_value = float(loss_qar.detach())
         unsup_value = float(gated.loss.detach())
         keep_fraction = float(gated.keep_fraction.detach())
         mean_weight = float(gated.mean_weight.detach())
@@ -162,6 +210,8 @@ def ssl_training_step(
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
     if step >= ema_warmup_steps:
         ema_update(teacher, student, alpha=ema_alpha)
 
@@ -170,6 +220,7 @@ def ssl_training_step(
         "loss": float(loss.detach()),
         "loss_sup": float(loss_sup.detach()),
         "loss_unsup": unsup_value,
+        "loss_qar": qar_value,
         "lambda_u": float(lam),
         "gate_keep_fraction": keep_fraction,
         "mean_gate_weight": mean_weight,
@@ -192,6 +243,8 @@ def evaluate_loader(model: nn.Module, loader, criterion: nn.Module, threshold: f
     gt_maps = []
     for images, masks in loader:
         out = model(images)
+        if isinstance(out, tuple):
+            out = out[0]
         losses.append(float(criterion(out, masks)))
         pred_maps.append(out[:, 0].detach().cpu().numpy())
         gt_maps.append(masks[:, 0].detach().cpu().numpy())
@@ -224,12 +277,26 @@ def run_ssl_loop(
     uncertainty: str = "off",
     uncertainty_tau: float = 0.75,
     pl_threshold: float = 0.0,
+    use_cutmix: bool = False,
+    qar_mode: str = "off",
+    lambda_qar: float = 0.1,
+    augment_labeled: bool = False,
 ) -> dict:
     torch.manual_seed(seed)
     teacher = copy.deepcopy(student).eval()
     for param in teacher.parameters():
         param.requires_grad_(False)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(int(steps), 1), eta_min=lr * 0.01
+    )
+    # Prevent gate lock-out when --ssl-warm-steps was left at its smoke default (1)
+    # on a multi-step training run (steps >= 10).
+    effective_warm_steps = (
+        max(1, int(round(0.2 * steps)))
+        if (int(warm_steps) == 1 and int(steps) >= 10)
+        else int(warm_steps)
+    )
     criterion = BceDiceLoss()
     history = []
     step = 0
@@ -249,7 +316,7 @@ def run_ssl_loop(
                 lambda_max=lambda_max,
                 tau0=tau0,
                 tau1=tau1,
-                warm_steps=warm_steps,
+                warm_steps=effective_warm_steps,
                 use_baq=use_baq,
                 quality_reweight=quality_reweight,
                 lambda_qw=lambda_qw,
@@ -257,6 +324,12 @@ def run_ssl_loop(
                 uncertainty=uncertainty,
                 uncertainty_tau=uncertainty_tau,
                 pl_threshold=pl_threshold,
+                use_cutmix=use_cutmix,
+                qar_mode=qar_mode,
+                lambda_qar=lambda_qar,
+                augment_labeled=augment_labeled,
+                seed=seed,
+                scheduler=scheduler,
             )
             history.append(row)
             print(format_ssl_log(row))
@@ -264,8 +337,13 @@ def run_ssl_loop(
             if step >= steps:
                 break
     metrics = evaluate_loader(student, val_loader, criterion)
+    teacher_metrics = evaluate_loader(teacher, val_loader, criterion)
     print(format_eval_log(metrics))
-    return {"history": history, "metrics": metrics}
+    return {
+        "history": history,
+        "metrics": metrics,
+        "teacher_metrics": teacher_metrics,
+    }
 
 
 def _validate_ssl_args(args) -> Optional[str]:
@@ -281,35 +359,22 @@ def _validate_ssl_args(args) -> Optional[str]:
         return "--ssl-pl-threshold must lie in [0, 1]."
     if bool(args.ssl_eval_npy) != bool(args.ssl_eval_mask_npy):
         return "Pass both --ssl-eval-npy and --ssl-eval-mask-npy, or neither."
-    synthetic = not (args.ssl_unlabeled_npy or args.ssl_labeled_npy or args.ssl_mask_npy or args.ssl_split)
-    if str(args.ssl_backbone) == "conv" and synthetic and int(args.ssl_image_size) < 32:
-        return (
-            "ConvLiteUNet needs --ssl-image-size >= 32 on the synthetic path "
-            "(five stride-2 pools). Real .npy runs use the array spatial size. "
-            "The tiny smoke student stays the default."
-        )
     return None
 
 
-_BACKBONE_STUDENT = {
-    "tiny": "TinySegStudent",
-    "conv": "ConvLiteUNet",
-    "mamba": "MambaLiteUNet",
-}
-
-
-def _backbone_record_name(backbone: str) -> str:
-    """Name stored in metrics.json. ConvLite is never recorded as Mamba."""
-    if backbone == "mamba":
-        return "mamba"
-    if backbone == "conv":
-        return "conv"
-    return "tiny"
-
-
-def _metrics_payload(args, metrics: dict, *, synthetic: bool, eval_split: str, backbone_name: str) -> dict:
+def _metrics_payload(
+    args,
+    metrics: dict,
+    *,
+    synthetic: bool,
+    eval_split: str,
+    backbone_name: str,
+    teacher_metrics: Optional[dict] = None,
+) -> dict:
     dice = metrics.get("f1_or_dsc")
-    return {
+    qar_mode = getattr(args, "ssl_qar", "off")
+    qar_field = QAR_STATUS if qar_mode == "off" else str(qar_mode)
+    payload = {
         "recipe": str(args.ssl_recipe or args.ssl_method),
         "method": str(args.ssl_method),
         "group": str(args.ssl_group),
@@ -317,9 +382,9 @@ def _metrics_payload(args, metrics: dict, *, synthetic: bool, eval_split: str, b
         "fraction_token": str(args.ssl_fraction),
         "fraction": str(args.ssl_fraction),
         "backbone": backbone_name,
-        "student": _BACKBONE_STUDENT.get(backbone_name, backbone_name),
         "gate": str(args.ssl_gate),
         "baq": bool(args.ssl_baq),
+        "cutmix": bool(getattr(args, "ssl_cutmix", False)),
         "quality_reweight": str(args.quality_reweight),
         "lambda_qw": float(args.ssl_lambda_qw) if args.quality_reweight != "off" else 0.0,
         "qw_ramp": str(args.ssl_qw_ramp),
@@ -330,7 +395,7 @@ def _metrics_payload(args, metrics: dict, *, synthetic: bool, eval_split: str, b
         "data": "synthetic" if synthetic else "local_npy",
         "eval_split": eval_split,
         "experimentally_validated": False,
-        "qar": QAR_STATUS,
+        "qar": qar_field,
         "steps": int(args.ssl_steps),
         "metrics": {
             "dice": dice,
@@ -346,6 +411,19 @@ def _metrics_payload(args, metrics: dict, *, synthetic: bool, eval_split: str, b
             "specificity": metrics.get("specificity"),
         },
     }
+    if teacher_metrics is not None:
+        t_dice = teacher_metrics.get("f1_or_dsc")
+        payload["teacher_metrics"] = {
+            "dice": t_dice,
+            "f1_or_dsc": t_dice,
+            "miou": teacher_metrics.get("miou"),
+            "hd95": teacher_metrics.get("hd95"),
+            "hd95_mean": teacher_metrics.get("hd95_mean"),
+            "assd": teacher_metrics.get("assd"),
+            "assd_mean": teacher_metrics.get("assd_mean"),
+            "loss": teacher_metrics.get("loss"),
+        }
+    return payload
 
 
 def run_from_args(args) -> int:
@@ -360,12 +438,18 @@ def run_from_args(args) -> int:
         print("The synthetic smoke path runs on CPU. Re-run with --ssl-device cpu.")
         return 2
 
-    synthetic = not (args.ssl_unlabeled_npy or args.ssl_labeled_npy or args.ssl_mask_npy or args.ssl_split)
+    synthetic = not (
+        args.ssl_unlabeled_npy or args.ssl_labeled_npy or args.ssl_mask_npy or args.ssl_split
+    )
+    qar_mode = str(getattr(args, "ssl_qar", "off"))
     print("QAM-Seg SSL path: MQE + QGC.")
     print("Implemented in code and exercised on this process only.")
     print("Not experimentally validated. No ISIC, HAM10000, or PH2 download.")
     print("No CVPR MambaLiteUNet metric is computed or claimed.")
-    print(f"QAR: {QAR_STATUS}. {QAR_REASON}")
+    if qar_mode == "off":
+        print(f"QAR: {QAR_STATUS}. {QAR_REASON}")
+    else:
+        print(f"QAR: {qar_mode} (Quality-Guided Feature Prototype Alignment, lambda_qar={float(getattr(args, 'ssl_lambda_qar', 0.1))}).")
     print(
         "SSL method: "
         f"{args.ssl_method}, gate: {args.ssl_gate}, "
@@ -378,28 +462,32 @@ def run_from_args(args) -> int:
         print("Supervised objective: unlabeled consistency is not applied.")
     if args.use_learned_quality_head:
         print("Learned MQE head flag is set, but the head stays a stub (weight a3 = 0, beta = 0).")
+
     backbone = str(args.ssl_backbone)
+    use_amf = not (bool(getattr(args, "no_amf", False)) or bool(getattr(args, "ablate_amf", False)))
+    use_lgfm = not (bool(getattr(args, "no_lgfm", False)) or bool(getattr(args, "ablate_lgfm", False)))
+    use_cga = not (bool(getattr(args, "no_cga", False)) or bool(getattr(args, "ablate_cga", False)))
+    scan_mode = str(getattr(args, "ssl_scan_mode", "four_way"))
+    global_mode = str(getattr(args, "ssl_global_mode", "attn"))
+
     if backbone == "mamba":
         try:
-            student = build_mamba_student()
+            student = build_mamba_student(
+                use_amf=use_amf,
+                use_lgfm=use_lgfm,
+                use_cga=use_cga,
+                scan_mode=scan_mode,
+                global_mode=global_mode,
+            )
         except BackboneUnavailable as exc:
             print(exc)
             return 2
         print("Student: MambaLiteUNet. Import succeeded.")
         print("This is not a CVPR reproduction. Logs from this process are not medical Dice or HD95 results.")
-    elif backbone == "conv":
-        try:
-            student = build_conv_student()
-        except ConvLiteUnavailable as exc:
-            print(exc)
-            return 2
-        print("Student: ConvLiteUNet.")
-        print("ConvLiteUNet is a capacity-matched CNN stand-in. It does not import mamba_ssm.")
-        print("It is not MambaLiteUNet. Do not report these logs as Mamba metrics.")
-        print("This is not a CVPR reproduction. Logs from this process are not medical Dice or HD95 results.")
     else:
         student = TinySegStudent()
         print("Student: TinySegStudent.")
+
     if synthetic:
         print("Data: synthetic blobs.")
     elif args.ssl_split:
@@ -418,6 +506,7 @@ def run_from_args(args) -> int:
             labeled_npy=args.ssl_labeled_npy,
             mask_npy=args.ssl_mask_npy,
             split_json=args.ssl_split,
+            augment_labeled=not synthetic,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"QAM-Seg: {exc}")
@@ -426,7 +515,8 @@ def run_from_args(args) -> int:
         labeled,
         unlabeled,
         batch_size=int(args.ssl_batch_size),
-        shuffle=False,
+        shuffle=not synthetic,
+        seed=int(args.ssl_seed),
     )
     if len(labeled_loader) == 0 or len(unlabeled_loader) == 0:
         print("QAM-Seg: a loader is empty after drop_last.")
@@ -450,6 +540,7 @@ def run_from_args(args) -> int:
                 labeled_npy=args.ssl_labeled_npy,
                 mask_npy=args.ssl_mask_npy,
                 split_json=args.ssl_split,
+                augment_labeled=False,
             )
             if not synthetic:
                 print("Eval: labeled train rows used for this run. Not a held-out test score.")
@@ -469,8 +560,6 @@ def run_from_args(args) -> int:
         return 2
     if device == "cuda":
         student = student.cuda()
-        # Loaders yield CPU tensors. Move them inside the loop only if asked.
-        # The default smoke path never takes this branch in CI without a GPU.
         labeled_loader = _DeviceLoader(labeled_loader, device)
         unlabeled_loader = _DeviceLoader(unlabeled_loader, device)
         val_loader = _DeviceLoader(val_loader, device)
@@ -495,6 +584,10 @@ def run_from_args(args) -> int:
         uncertainty=str(args.ssl_uncertainty),
         uncertainty_tau=float(args.ssl_uncertainty_tau),
         pl_threshold=float(args.ssl_pl_threshold),
+        use_cutmix=bool(getattr(args, "ssl_cutmix", False)),
+        qar_mode=qar_mode,
+        lambda_qar=float(getattr(args, "ssl_lambda_qar", 0.1)),
+        augment_labeled=not synthetic,
     )
     if not result["history"]:
         print("QAM-Seg: SSL loop produced no steps.")
@@ -505,7 +598,8 @@ def run_from_args(args) -> int:
             result["metrics"],
             synthetic=synthetic,
             eval_split=eval_split,
-            backbone_name=_backbone_record_name(backbone),
+            backbone_name="mamba" if backbone == "mamba" else "tiny",
+            teacher_metrics=result.get("teacher_metrics"),
         )
         destination = os.path.join(str(args.ssl_out_dir), "metrics.json")
         write_metrics_file(destination, payload)

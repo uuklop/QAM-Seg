@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """Print parameter count and, when a profiler imports, FLOPs at 256x256.
 
-Profiles the MambaLiteUNet class in this fork. It does not download data or
-checkpoints, does not train, and does not report the CVPR paper's complexity
-table. See the README ERRATA and upstream issues:
-
-- https://github.com/maklachur/MambaLiteUNet/issues/3
-- https://github.com/maklachur/MambaLiteUNet/issues/4
-
-Prefer `thop`, then `fvcore`. If the backbone cannot be imported (typical on a
-machine without `mamba_ssm`), this script prints install instructions and
-exits 0 with `status: stub`.
+Profiles the MambaLiteUNet class in this fork, including optional ablation
+bypasses (--no-amf, --no-lgfm, --no-cga) and scan/mixing modes (--scan-mode,
+--global-mode). It does not download data or checkpoints, does not train, and
+does not report the CVPR paper's complexity table.
 """
 
 from __future__ import annotations
@@ -29,12 +23,7 @@ DEFAULT_C_LIST = [16, 32, 48, 64, 96, 128]
 
 
 def _read_c_list():
-    """Read model_config c_list without importing the training config.
-
-    Importing configs/config_setting.py builds the loss and a timestamped
-    work directory. A regex keeps this script side-effect free. On a parse
-    failure, fall back to the released default and say so.
-    """
+    """Read model_config c_list without importing the training config."""
     path = ROOT / 'configs' / 'config_setting.py'
     text = path.read_text(encoding='utf-8')
     match = re.search(r"""['"]c_list['"]\s*:\s*\[([0-9,\s]+)\]""", text)
@@ -90,7 +79,7 @@ def _try_thop(model, dummy):
         return False
     try:
         macs, params = profile(model, inputs=(dummy,), verbose=False)
-    except Exception as exc:  # profiler must not hide the param count already printed
+    except Exception as exc:
         print(f'thop: failed ({type(exc).__name__}: {exc})')
         return False
     print(f'thop_macs: {macs}')
@@ -136,12 +125,29 @@ def main(argv=None):
         default='cpu',
         help='cpu (default) or cuda. FLOP tools run a forward; params do not.',
     )
+    parser.add_argument('--no-amf', action='store_true', help='Bypass AMF blocks.')
+    parser.add_argument('--no-lgfm', action='store_true', help='Bypass LGFM blocks.')
+    parser.add_argument('--no-cga', action='store_true', help='Bypass CGA skip gates.')
+    parser.add_argument(
+        '--scan-mode',
+        default='four_way',
+        choices=('four_way', 'unidirectional'),
+    )
+    parser.add_argument(
+        '--global-mode',
+        default='attn',
+        choices=('attn', 'spectral'),
+    )
     args = parser.parse_args(argv)
 
     c_list = _read_c_list()
     print('QAM-Seg complexity probe')
     print('backbone: MambaLiteUNet (supervised code in this fork)')
     print(f'c_list: {c_list}')
+    print(
+        f'config: use_amf={not args.no_amf}, use_lgfm={not args.no_lgfm}, '
+        f'use_cga={not args.no_cga}, scan_mode={args.scan_mode}, global_mode={args.global_mode}'
+    )
     print(f'input: ({args.batch}, 3, {args.height}, {args.width})')
     print('paper_table: not reported by this script')
 
@@ -165,6 +171,11 @@ def main(argv=None):
             num_classes=1,
             input_channels=3,
             c_list=c_list,
+            use_amf=not args.no_amf,
+            use_lgfm=not args.no_lgfm,
+            use_cga=not args.no_cga,
+            scan_mode=args.scan_mode,
+            global_mode=args.global_mode,
         )
         model.eval()
         device_name = args.device

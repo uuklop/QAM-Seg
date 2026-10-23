@@ -12,7 +12,9 @@ Ablation names match the method note:
 - ``qam-gated-baq-qw`` (gated + BAQ + sample MQE reweight)
 
 ``qam-qw`` is the direct PL-QW analogue: no hard gate, sample reweight
-on the MQE score. Baselines are supervised, plain mean teacher, entropy
+on the MQE score. ``qam-qar`` and ``qam-full`` add Quality-Guided Feature
+Prototype Alignment (``--ssl-qar prototype``) and Quality-Guided CutMix
+(``--ssl-cutmix``). Baselines are supervised, plain mean teacher, entropy
 UA-MT (not MC dropout), and confidence-threshold pseudo-labels.
 """
 
@@ -36,6 +38,8 @@ class Recipe:
     quality_reweight: str
     group: str
     include_full: bool = False
+    qar: str = "off"
+    cutmix: bool = False
 
 
 RECIPES: dict[str, Recipe] = {
@@ -49,9 +53,11 @@ RECIPES: dict[str, Recipe] = {
     "qam-gated-baq-qw": Recipe("qam-gated-baq-qw", "qam", "gated", True, "sample", "ablation"),
     "qam-qw": Recipe("qam-qw", "qam", "ungated", False, "sample", "ablation"),
     "qam-qw-pixel": Recipe("qam-qw-pixel", "qam", "ungated", False, "pixel", "ablation"),
+    "qam-qar": Recipe("qam-qar", "qam", "gated", True, "sample", "ablation", False, "prototype", False),
+    "qam-full": Recipe("qam-full", "qam", "gated", True, "sample", "ablation", False, "prototype", True),
 }
 
-# Overnight matrix. Pixel reweight is registered but not in this tuple.
+# Overnight matrix. Pixel reweight, qam-qar, and qam-full are registered and selectable via --recipes.
 DEFAULT_RECIPE_NAMES: tuple[str, ...] = (
     "supervised",
     "mt",
@@ -83,6 +89,8 @@ class Job:
     gate: str
     baq: bool
     quality_reweight: str
+    qar: str = "off"
+    cutmix: bool = False
 
 
 def parse_recipe_names(text: str) -> tuple[str, ...]:
@@ -146,6 +154,8 @@ def iter_jobs(
                         gate=recipe.gate,
                         baq=recipe.baq,
                         quality_reweight=recipe.quality_reweight,
+                        qar=recipe.qar,
+                        cutmix=recipe.cutmix,
                     )
                 )
             if recipe.include_full:
@@ -160,6 +170,8 @@ def iter_jobs(
                         gate=recipe.gate,
                         baq=recipe.baq,
                         quality_reweight=recipe.quality_reweight,
+                        qar=recipe.qar,
+                        cutmix=recipe.cutmix,
                     )
                 )
     return jobs
@@ -222,6 +234,10 @@ def job_argv(
         argv.extend(["--ssl-image-size", str(int(image_size))])
     if job.baq:
         argv.append("--ssl-baq")
+    if getattr(job, "cutmix", False):
+        argv.append("--ssl-cutmix")
+    if getattr(job, "qar", "off") != "off":
+        argv.extend(["--ssl-qar", str(job.qar)])
     if job.method == "uamt":
         argv.extend(["--ssl-uncertainty", "entropy", "--ssl-uncertainty-tau", str(float(uncertainty_tau))])
     if job.method == "pl":

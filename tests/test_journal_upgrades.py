@@ -264,6 +264,17 @@ class MambaDisagreementAndPrototypeQarTests(unittest.TestCase):
     def test_ssl_loop_with_cutmix_and_prototype_qar_runs_cleanly(self):
         from qamseg.data import build_ssl_datasets
 
+        def _to_cuda(batch):
+            # Unlabeled batches are a single Tensor. Iterating that walks the
+            # batch dim, and Tensor() rejects a generator ("data must be a
+            # sequence"). Recurse so tensors move as a whole and list/tuple
+            # batches keep their type.
+            if torch.is_tensor(batch):
+                return batch.cuda(non_blocking=True)
+            if isinstance(batch, (list, tuple)):
+                return type(batch)(_to_cuda(item) for item in batch)
+            return batch
+
         def _cuda_loader(loader):
             class _Loader:
                 def __len__(self):
@@ -271,7 +282,7 @@ class MambaDisagreementAndPrototypeQarTests(unittest.TestCase):
 
                 def __iter__(self):
                     for batch in loader:
-                        yield type(batch)(item.cuda() for item in batch)
+                        yield _to_cuda(batch)
 
             return _Loader()
 

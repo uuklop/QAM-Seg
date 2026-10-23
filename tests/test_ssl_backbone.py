@@ -1,28 +1,16 @@
-"""Optional MambaLiteUNet hook and the ConvLiteUNet stand-in."""
+"""Optional MambaLiteUNet hook. The real class is not required."""
 
-import io
-import json
 import subprocess
 import sys
-import tempfile
 import unittest
-from contextlib import redirect_stdout
-from pathlib import Path
 from unittest import mock
 
 import torch
 from torch import nn
 
-from models.ConvLiteUNet import ConvLiteUNet
-from qamseg.backbones import (
-    BackboneUnavailable,
-    ConvLiteUnavailable,
-    build_conv_student,
-    build_mamba_student,
-    read_c_list,
-)
+from qamseg.backbones import BackboneUnavailable, build_mamba_student, read_c_list
 from qamseg.cli import parse_train_args
-from qamseg.train_ssl import run_from_args
+from qamseg.train_ssl import TinySegStudent, run_from_args
 
 
 class _FakeMamba(nn.Module):
@@ -52,13 +40,10 @@ class BackboneTests(unittest.TestCase):
         args, _unknown, _reserved = parse_train_args(
             ["--ssl", "--ssl-steps", "1", "--ssl-image-size", "16", "--ssl-batch-size", "2"]
         )
-        with mock.patch("qamseg.backbones.import_mamba_lite_unet") as importer, mock.patch(
-            "qamseg.backbones.import_conv_lite_unet"
-        ) as conv_importer:
+        with mock.patch("qamseg.backbones.import_mamba_lite_unet") as importer:
             code = run_from_args(args)
         self.assertEqual(code, 0)
         importer.assert_not_called()
-        conv_importer.assert_not_called()
 
     def test_requested_mamba_uses_the_imported_class(self):
         _FakeMamba.built = 0
@@ -147,85 +132,6 @@ class BackboneTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Student: TinySegStudent", completed.stdout)
-
-    def test_conv_student_constructs_and_forwards(self):
-        student = build_conv_student()
-        self.assertIsInstance(student, ConvLiteUNet)
-        self.assertEqual(student.c_list, [16, 32, 48, 64, 96, 128])
-        y = student(torch.zeros(1, 3, 32, 32))
-        self.assertEqual(tuple(y.shape), (1, 1, 32, 32))
-        self.assertTrue(torch.all(y >= 0))
-        self.assertTrue(torch.all(y <= 1))
-
-    def test_conv_smoke_does_not_import_mamba_or_label_itself_mamba(self):
-        args, _unknown, _reserved = parse_train_args(
-            [
-                "--ssl",
-                "--ssl-backbone",
-                "conv",
-                "--ssl-steps",
-                "1",
-                "--ssl-image-size",
-                "32",
-                "--ssl-batch-size",
-                "1",
-            ]
-        )
-        self.assertEqual(args.ssl_backbone, "conv")
-        with tempfile.TemporaryDirectory() as tmp:
-            args.ssl_out_dir = tmp
-            buffer = io.StringIO()
-            with mock.patch("qamseg.backbones.import_mamba_lite_unet") as importer, redirect_stdout(buffer):
-                code = run_from_args(args)
-            text = buffer.getvalue()
-            self.assertEqual(code, 0, text)
-            importer.assert_not_called()
-            self.assertIn("Student: ConvLiteUNet.", text)
-            self.assertNotIn("Student: MambaLiteUNet", text)
-            self.assertNotIn("Student: TinySegStudent", text)
-            self.assertIn("not MambaLiteUNet", text)
-            payload = json.loads((Path(tmp) / "metrics.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["backbone"], "conv")
-        self.assertEqual(payload["student"], "ConvLiteUNet")
-        self.assertNotEqual(payload["backbone"], "mamba")
-        self.assertFalse(payload["experimentally_validated"])
-        self.assertEqual(payload["qar"], "skipped")
-        self.assertEqual(payload["data"], "synthetic")
-
-    def test_conv_import_failure_does_not_fall_back(self):
-        def explode():
-            raise ImportError("ConvLite missing")
-
-        args, _unknown, _reserved = parse_train_args(
-            ["--ssl", "--ssl-backbone", "conv", "--ssl-steps", "1", "--ssl-image-size", "32"]
-        )
-        with mock.patch("qamseg.backbones.import_conv_lite_unet", side_effect=explode):
-            code = run_from_args(args)
-        self.assertEqual(code, 2)
-        with self.assertRaises(ConvLiteUnavailable) as ctx:
-            build_conv_student(importer=explode)
-        message = str(ctx.exception)
-        self.assertIn("explicitly requested", message)
-        self.assertIn("not Mamba", message)
-
-    def test_conv_synthetic_below_32_exits_before_training(self):
-        args, _unknown, _reserved = parse_train_args(
-            [
-                "--ssl",
-                "--ssl-backbone",
-                "conv",
-                "--ssl-steps",
-                "1",
-                "--ssl-image-size",
-                "16",
-                "--ssl-batch-size",
-                "1",
-            ]
-        )
-        with mock.patch("qamseg.backbones.import_conv_lite_unet") as importer:
-            code = run_from_args(args)
-        self.assertEqual(code, 2)
-        importer.assert_not_called()
 
 
 if __name__ == "__main__":

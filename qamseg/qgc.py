@@ -1,12 +1,15 @@
 """Quality-Gated Consistency (QGC).
 
 Reweights unsupervised BCE + Dice against a stop-grad teacher (or weak-view)
-pseudo-label. Hard, soft, and the doc's drop-then-weight gate are supported.
+pseudo-label. Hard, soft, and drop-then-weight (``gated``) modes are supported.
 An empty gate returns a zero that stays on the student graph and does not
 divide by zero.
 
-``lambda_u`` and ``tau`` helpers are the curriculum placeholders from the
-method note. They are not tuned.
+Fixes the image-weight cancellation bug where dividing ``(weights * bce).sum()``
+by ``weights.sum()`` canceled out scalar image quality weights ``q^gamma``
+whenever ``batch_size == 1`` or only one sample in the batch passed ``q >= tau``.
+Spatial pixel weights are now normalized per active image while preserving the
+continuous image-level quality scale ``q^gamma``.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from qamseg.mqe import QualityEstimate, as_prob_maps
 
 @dataclass(frozen=True)
 class GateConfig:
-    """Gating placeholders. ``tau`` is overridden by the curriculum when training."""
+    """Gating configuration. ``tau`` is overridden by the curriculum when training."""
 
     mode: str = "gated"
     level: str = "both"
@@ -87,30 +90,28 @@ def _score_to_weight(score: Tensor, mode: str, tau: float, gamma: float) -> Tens
     raise ValueError(f"Unknown gate mode: {mode}")
 
 
-def gate_weights(quality: QualityEstimate, config: GateConfig) -> Tensor:
-    """Pixel weights in ``[0, 1]`` with shape ``(B, 1, H, W)``.
-
-    ``gated`` + ``both`` follows the plan: reject the whole image when
-    ``q < tau``, and otherwise multiply by ``q^gamma`` and the pixel map.
-    The pixel map is not thresholded a second time in that mode.
-    """
+def _image_and_pixel_gate(
+    quality: QualityEstimate,
+    config: GateConfig,
+) -> tuple[Tensor, Tensor]:
+    """Return ``(image_w (B, 1, 1, 1), pix_w (B, 1, H, W))`` in ``[0, 1]``."""
     pixel = as_prob_maps(quality.pixel_weight).detach()
     q = quality.q.detach().float().view(-1)
     if q.shape[0] != pixel.shape[0]:
         raise ValueError(
             f"Gate batch mismatch: q {tuple(q.shape)} vs pixels {tuple(pixel.shape)}"
         )
-    q = q.to(device=pixel.device)
+    q = q.to(device=pixel.device, dtype=pixel.dtype)
 
     if config.mode == "ungated":
-        return torch.ones_like(pixel)
+        ones_i = torch.ones(pixel.shape[0], 1, 1, 1, device=pixel.device, dtype=pixel.dtype)
+        return ones_i, torch.ones_like(pixel)
 
     use_image = config.level in ("image", "both")
     use_pixel = config.level in ("pixel", "both")
 
     if use_image:
-        image_w = _score_to_weight(q, config.mode, config.tau, config.gamma)
-        image_w = image_w.view(-1, 1, 1, 1)
+        image_w = _score_to_weight(q, config.mode, config.tau, config.gamma).view(-1, 1, 1, 1)
     else:
         image_w = torch.ones(pixel.shape[0], 1, 1, 1, device=pixel.device, dtype=pixel.dtype)
 
@@ -122,6 +123,12 @@ def gate_weights(quality: QualityEstimate, config: GateConfig) -> Tensor:
     else:
         pix_w = torch.ones_like(pixel)
 
+    return image_w.clamp(0.0, 1.0), pix_w.clamp(0.0, 1.0)
+
+
+def gate_weights(quality: QualityEstimate, config: GateConfig) -> Tensor:
+    """Pixel weights in ``[0, 1]`` with shape ``(B, 1, H, W)``."""
+    image_w, pix_w = _image_and_pixel_gate(quality, config)
     return (image_w * pix_w).clamp(0.0, 1.0)
 
 
@@ -133,8 +140,9 @@ def quality_gated_consistency_loss(
 ) -> GateResult:
     """Weighted BCE + Dice. Teacher targets and gate weights are stop-grad.
 
-    If every weight is zero the loss is ``student.sum() * 0``, which is
-    finite, backpropagates as zeros, and does not divide by the weight sum.
+    Normalizes spatial pixel weights per active image and multiplies by the
+    continuous image-level quality weight ``image_w`` so ``q^gamma`` is not
+    canceled out when ``batch_size == 1`` or only one image passes ``tau``.
     """
     if config is None:
         config = GateConfig()
@@ -149,7 +157,10 @@ def quality_gated_consistency_loss(
     else:
         target = teacher.clamp(0.0, 1.0).to(dtype=student.dtype)
 
-    weights = gate_weights(quality, config).to(device=student.device, dtype=student.dtype)
+    image_w, pix_w = _image_and_pixel_gate(quality, config)
+    image_w = image_w.to(device=student.device, dtype=student.dtype)
+    pix_w = pix_w.to(device=student.device, dtype=student.dtype)
+    weights = (image_w * pix_w).clamp(0.0, 1.0)
     if weights.shape != student.shape:
         raise ValueError(
             f"QGC weight shape {tuple(weights.shape)} != student {tuple(student.shape)}"
@@ -167,19 +178,28 @@ def quality_gated_consistency_loss(
         )
 
     bce = F.binary_cross_entropy(student, target, reduction="none")
-    weight_sum = weights.sum()
-    bce_loss = (weights * bce).sum() / (weight_sum + config.eps)
-
     batch = student.shape[0]
+    flat_pix_w = pix_w.view(batch, -1)
     flat_w = weights.view(batch, -1)
+    flat_bce = bce.view(batch, -1)
     flat_p = student.view(batch, -1)
     flat_t = target.view(batch, -1)
-    image_mass = flat_w.sum(dim=1)
-    intersection = (flat_w * flat_p * flat_t).sum(dim=1)
-    denom = (flat_w * flat_p).sum(dim=1) + (flat_w * flat_t).sum(dim=1)
-    dice = (2.0 * intersection + config.eps) / (denom + config.eps)
-    alive = image_mass > 0
-    dice_loss = (image_mass[alive] * (1.0 - dice[alive])).sum() / image_mass[alive].sum().clamp_min(config.eps)
+
+    img_scale = image_w.view(batch)
+    pix_mass = flat_pix_w.sum(dim=1)
+    alive = (flat_w.sum(dim=1) > 0) & (pix_mass > 0)
+
+    # Spatial normalization per active image, weighted by uncancelled image quality img_scale
+    bce_per_img = (flat_pix_w[alive] * flat_bce[alive]).sum(dim=1) / pix_mass[alive].clamp_min(config.eps)
+    intersection = (flat_pix_w[alive] * flat_p[alive] * flat_t[alive]).sum(dim=1)
+    denom = (flat_pix_w[alive] * flat_p[alive]).sum(dim=1) + (flat_pix_w[alive] * flat_t[alive]).sum(dim=1)
+    dice_per_img = (2.0 * intersection + config.eps) / (denom + config.eps)
+    dice_loss_per_img = 1.0 - dice_per_img
+
+    active_img_w = img_scale[alive]
+    num_alive = float( int(alive.sum().item()) )
+    bce_loss = (active_img_w * bce_per_img).sum() / max(num_alive, 1.0)
+    dice_loss = (active_img_w * dice_loss_per_img).sum() / max(num_alive, 1.0)
 
     loss = config.bce_weight * bce_loss + config.dice_weight * dice_loss
     return GateResult(

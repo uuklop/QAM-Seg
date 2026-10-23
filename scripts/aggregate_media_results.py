@@ -50,7 +50,6 @@ def main(argv=None) -> int:
     print(f"Wrote {csv_path}")
     print(f"Wrote {md_path}")
     print("Rows mix only within the same recipe, fraction, backbone, data tag, and eval split.")
-    print("backbone conv is ConvLiteUNet. Do not read those rows as MambaLiteUNet.")
     return 0
 
 

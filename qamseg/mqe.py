@@ -1,22 +1,22 @@
 """Multi-cue Quality Estimator (MQE).
 
-Pure functions on probability maps. No learned head is used unless the
-caller passes a score and a positive learned weight. Nothing here is an
-experimental result, and nothing here is AMF, LGFM, or CGA.
+Pure functions on probability maps and optional Mamba directional branch
+disagreement maps.
 
 Cues, all in ``[0, 1]`` after scaling:
 
 - predictive entropy of a Bernoulli (sigmoid) mask, divided by ``ln 2``
 - teacher–student absolute disagreement on a shared view
-- weak/strong pseudo-mask Dice agreement
+- weak/strong pseudo-mask Dice agreement (on spatially aligned views)
 - mean entropy inside a band around the 0.5 contour
+- optional Mamba 4-way directional scan disagreement (from AMF branches)
 
 Default fusion is a weighted average of the active cues (the linear part
 of the design combination, already in ``[0, 1]``). ``fusion="sigmoid"``
 applies the written ``σ(a·cues)`` form. With non-negative weights that
 sum is non-negative, so a plain sigmoid cannot fall below 0.5;
 ``center=True`` subtracts half the active weight sum first so a threshold
-can sit on both sides of the score. Cue weights are placeholders.
+can sit on both sides of the score.
 """
 
 from __future__ import annotations
@@ -42,10 +42,11 @@ class QualityWeights:
     disagreement: float = 1.0
     agreement: float = 1.0
     boundary: float = 1.0
+    mamba: float = 1.0
     learned: float = 0.0
 
     def __post_init__(self):
-        for name in ("entropy", "disagreement", "agreement", "boundary", "learned"):
+        for name in ("entropy", "disagreement", "agreement", "boundary", "mamba", "learned"):
             value = getattr(self, name)
             if value < 0:
                 raise ValueError(f"MQE weight {name} must be non-negative, got {value}")
@@ -53,7 +54,7 @@ class QualityWeights:
 
 @dataclass
 class QualityEstimate:
-    """Image score ``q`` and an optional pixel weight map, both in ``[0, 1]``."""
+    """Image score ``q`` and a pixel weight map, both in ``[0, 1]``."""
 
     q: Tensor
     pixel_weight: Tensor
@@ -62,15 +63,11 @@ class QualityEstimate:
     agreement: Optional[Tensor] = None
     boundary_entropy: Optional[Tensor] = None
     learned_score: Optional[Tensor] = None
+    mamba_disagreement: Optional[Tensor] = None
 
 
 class LearnedQualityHead(nn.Module):
-    """1×1 map from teacher features to a reliability score in ``(0, 1)``.
-
-    Stub only. The smoke trainer does not construct this module and does
-    not apply ``L_Q``. Pass the output into ``estimate_quality`` with
-    ``QualityWeights.learned > 0`` when a later run actually trains it.
-    """
+    """1×1 map from teacher features to a reliability score in ``(0, 1)``."""
 
     def __init__(self, in_channels: int):
         super().__init__()
@@ -199,8 +196,7 @@ def boundary_band_entropy(
 
     Returns ``(band_entropy (B,), band (B, 1, H, W))``. An empty band
     falls back to the full-image mean so the reduction never divides by
-    zero. That fallback is the same value as image-level entropy, not a
-    claim that the contour was certain.
+    zero.
     """
     entropy = normalized_entropy(probs, eps=eps)
     band = boundary_band_mask(probs, threshold=threshold, radius=radius)
@@ -222,11 +218,7 @@ def reliability_target(
     threshold: float = 0.5,
     eps: float = 1e-6,
 ) -> Tensor:
-    """Labeled reliability target ``r = 1[correct] * (1 - H)``.
-
-    For a later ``L_Q`` only. Pseudo-labels are not targets. Correctness
-    is the match between the 0.5-thresholded probability and the label.
-    """
+    """Labeled reliability target ``r = 1[correct] * (1 - H)``."""
     pred = as_prob_maps(probs)
     target = as_prob_maps(labels)
     if pred.shape != target.shape:
@@ -238,16 +230,30 @@ def reliability_target(
     return correct * confidence
 
 
-def gradient_magnitude(image: Tensor, eps: float = 1e-6) -> Tensor:
-    """Per-image min–max normalized gradient magnitude, shape ``(B, 1, H, W)``."""
+def gradient_magnitude(
+    image: Tensor,
+    eps: float = 1e-6,
+    smooth: Optional[bool] = None,
+) -> Tensor:
+    """Per-image min–max normalized gradient magnitude, shape ``(B, 1, H, W)``.
+
+    For full-resolution dermoscopy images (spatial size >= 32), applies a 3x3
+    smoothing filter prior to finite differences so thin hair artifacts do not
+    dominate the boundary prior.
+    """
     if image.ndim == 3:
         image = image.unsqueeze(1)
     if image.ndim != 4:
         raise ValueError(f"Expected an image tensor, got shape {tuple(image.shape)}")
-    dx = torch.zeros_like(image)
-    dy = torch.zeros_like(image)
-    dx[..., :, 1:] = image[..., :, 1:] - image[..., :, :-1]
-    dy[..., 1:, :] = image[..., 1:, :] - image[..., :-1, :]
+    work = image.float()
+    if smooth is None:
+        smooth = min(int(work.shape[-2]), int(work.shape[-1])) >= 32
+    if smooth:
+        work = F.avg_pool2d(work, kernel_size=3, stride=1, padding=1)
+    dx = torch.zeros_like(work)
+    dy = torch.zeros_like(work)
+    dx[..., :, 1:] = work[..., :, 1:] - work[..., :, :-1]
+    dy[..., 1:, :] = work[..., 1:, :] - work[..., :-1, :]
     magnitude = torch.sqrt(dx.square() + dy.square() + eps).mean(dim=1, keepdim=True)
     low = magnitude.amin(dim=(2, 3), keepdim=True)
     high = magnitude.amax(dim=(2, 3), keepdim=True)
@@ -261,8 +267,7 @@ def apply_boundary_aware_prior(
 ) -> Tensor:
     """Down-weight pixels where the image gradient is high and quality is low.
 
-    Optional BAQ factor ``1 - grad * (1 - q)``. Default training leaves
-    this off. The result stays in ``[0, 1]``.
+    Optional BAQ factor ``1 - grad * (1 - q_pix)``. The result stays in ``[0, 1]``.
     """
     weight = as_prob_maps(pixel_weight).clamp(0.0, 1.0)
     grad = as_prob_maps(grad_mag).clamp(0.0, 1.0)
@@ -299,6 +304,7 @@ def estimate_quality(
     student_probs: Optional[Tensor] = None,
     view_probs: Optional[Tensor] = None,
     learned_score: Optional[Tensor] = None,
+    mamba_disagreement: Optional[Tensor] = None,
     weights: Optional[QualityWeights] = None,
     boundary_radius: int = 1,
     agreement_mode: str = "hard",
@@ -310,7 +316,9 @@ def estimate_quality(
 
     Inputs are detached. ``student_probs`` is the student on the same
     (weak) view as the teacher. ``view_probs`` is the other view used for
-    Dice agreement, typically the strongly augmented student output.
+    Dice agreement, aligned to the same coordinate frame.
+    ``mamba_disagreement`` is the optional 4-way directional state-space
+    disagreement map from ``MambaLiteUNet``'s AMF blocks.
     """
     if weights is None:
         weights = QualityWeights()
@@ -335,6 +343,17 @@ def estimate_quality(
         radius=boundary_radius,
         eps=eps,
     )
+    mamba_d = None
+    if mamba_disagreement is not None and weights.mamba > 0:
+        mamba_d = as_prob_maps(mamba_disagreement).detach().clamp(0.0, 1.0)
+        if mamba_d.shape[-2:] != teacher.shape[-2:]:
+            mamba_d = F.interpolate(
+                mamba_d, size=teacher.shape[-2:], mode="bilinear", align_corners=False
+            ).clamp(0.0, 1.0)
+        if mamba_d.shape[0] != teacher.shape[0]:
+            raise ValueError(
+                f"Mamba disagreement batch {mamba_d.shape[0]} != teacher {teacher.shape[0]}"
+            )
     learned = None
     if learned_score is not None and weights.learned > 0:
         learned = as_prob_maps(learned_score).detach().clamp(0.0, 1.0)
@@ -351,12 +370,16 @@ def estimate_quality(
         image_parts.append((1.0 - disagreement.mean(dim=(1, 2, 3)), weights.disagreement))
     if agreement is not None:
         image_parts.append((agreement, weights.agreement))
+    if mamba_d is not None:
+        image_parts.append((1.0 - mamba_d.mean(dim=(1, 2, 3)), weights.mamba))
     if learned is not None:
         image_parts.append((learned.mean(dim=(1, 2, 3)), weights.learned))
 
     pixel_parts: list[tuple[Tensor, float]] = [(1.0 - entropy, weights.entropy)]
     if disagreement is not None:
         pixel_parts.append((1.0 - disagreement, weights.disagreement))
+    if mamba_d is not None:
+        pixel_parts.append((1.0 - mamba_d, weights.mamba))
     if learned is not None:
         pixel_parts.append((learned, weights.learned))
 
@@ -370,4 +393,5 @@ def estimate_quality(
         agreement=agreement,
         boundary_entropy=boundary_entropy,
         learned_score=learned,
+        mamba_disagreement=mamba_d,
     )

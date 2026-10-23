@@ -6,6 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 import numpy as np
 import torch
@@ -16,6 +21,7 @@ from qamseg.mqe import QualityEstimate, estimate_quality
 from qamseg.qar import QAR_STATUS, quality_aware_regularization
 from qamseg.qgc import GateConfig, gate_weights, quality_gated_consistency_loss
 from qamseg.reweight import ReweightConfig, qw_alpha, unlabeled_consistency_loss
+from require_mamba_cuda import skip_unless_mamba_cuda
 from utils import assd_binary, hd95_binary
 
 
@@ -263,7 +269,7 @@ class SubprocessReweightTests(unittest.TestCase):
                 "--ssl-steps",
                 "1",
                 "--ssl-image-size",
-                "16",
+                "32",
                 "--ssl-batch-size",
                 "2",
                 *extra,
@@ -277,22 +283,26 @@ class SubprocessReweightTests(unittest.TestCase):
         self.assertIn("QAR: skipped", completed.stdout)
         return completed.stdout
 
+    @skip_unless_mamba_cuda
     def test_sample_and_pixel_paths_smoke(self):
         sample = self._run(["--quality-reweight", "sample", "--ssl-gate", "ungated"])
         self.assertIn("reweight: sample", sample)
         pixel = self._run(["--quality-reweight", "pixel", "--ssl-qw-ramp", "linear"])
         self.assertIn("reweight: pixel", pixel)
 
+    @skip_unless_mamba_cuda
     def test_baseline_methods_smoke(self):
         for method in ("mt", "uamt", "pl", "supervised"):
             text = self._run(["--ssl-method", method])
             self.assertIn(f"SSL method: {method}", text)
             self.assertIn("reweight: off", text)
 
+    @skip_unless_mamba_cuda
     def test_default_ssl_still_exits_zero(self):
         text = self._run([])
         self.assertIn("reweight: off", text)
-        self.assertIn("Student: TinySegStudent", text)
+        self.assertIn("Student: MambaLiteUNet", text)
+        self.assertNotIn("TinySegStudent", text)
 
     def test_held_out_eval_name_is_allowed_only_for_eval(self):
         with tempfile.TemporaryDirectory() as tmp:

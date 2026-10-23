@@ -6,6 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 import numpy as np
 
@@ -16,6 +21,7 @@ from qamseg.data import (
     iter_dual_batches,
     load_unlabeled_array,
 )
+from require_mamba_cuda import skip_unless_mamba_cuda
 
 
 class DualLoaderTests(unittest.TestCase):
@@ -109,11 +115,12 @@ class DualLoaderTests(unittest.TestCase):
                 load_labeled_arrays(test_images, test_masks)
             self.assertIn("test", str(ctx.exception).lower())
 
+    @skip_unless_mamba_cuda
     def test_train_py_split_flag_uses_local_rows_only(self):
         from qamseg.splits import make_labeled_fraction_split, write_split_files
 
-        images = np.zeros((20, 8, 8, 3), dtype=np.float32)
-        masks = np.zeros((20, 8, 8), dtype=np.float32)
+        images = np.zeros((20, 32, 32, 3), dtype=np.float32)
+        masks = np.zeros((20, 32, 32), dtype=np.float32)
         manifest = make_labeled_fraction_split([str(index) for index in range(20)], seed=0)
         with tempfile.TemporaryDirectory() as tmp:
             destination = write_split_files(manifest, os.path.join(tmp, "splits"))
@@ -142,7 +149,8 @@ class DualLoaderTests(unittest.TestCase):
                 text=True,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-        self.assertIn("Student: TinySegStudent", completed.stdout)
+        self.assertIn("Student: MambaLiteUNet", completed.stdout)
+        self.assertNotIn("TinySegStudent", completed.stdout)
         self.assertIn("not a test score", completed.stdout)
         self.assertIn("gate_keep_fraction:", completed.stdout)
         self.assertIn("Not experimentally validated", completed.stdout)

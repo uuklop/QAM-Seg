@@ -1,8 +1,9 @@
 """MedIA job matrix for QAM-Seg.
 
-Recipes share one student, one split generator, and one metric file.
-Nothing here downloads a dataset or imports ``mamba_ssm``. ``--smoke``
-runs the synthetic CPU path. A real run requires local train arrays.
+Recipes share one student (MambaLiteUNet), one split generator, and one
+metric file. Nothing here downloads a dataset or imports ``mamba_ssm``.
+``--smoke`` runs a short synthetic CUDA path on that student. A real run
+requires local train arrays and CUDA. There is no CPU student.
 
 Ablation names match the method note:
 

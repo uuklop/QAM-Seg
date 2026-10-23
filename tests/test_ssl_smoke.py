@@ -1,19 +1,30 @@
-"""CPU smoke of the SSL step, EMA, and the metric names shared with engine.py."""
+"""SSL step, EMA, and the metric names shared with engine.py.
+
+Training-step smokes construct MambaLiteUNet and are skipped when CUDA
+or mamba_ssm is missing.
+"""
 
 import os
+import sys
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("MPLBACKEND", "Agg")
+
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 import torch
 from torch import nn
 
+from qamseg.backbones import build_mamba_student
 from qamseg.data import build_dual_loaders, build_ssl_datasets
 from qamseg.ema import ema_update
 from qamseg.metrics import binary_pixel_metrics, format_eval_log, format_ssl_log, hd95_for_log
 from qamseg.qgc import GateConfig
 from qamseg.train_ssl import evaluate_loader, run_ssl_loop, ssl_training_step
-from qamseg.train_ssl import TinySegStudent
+from require_mamba_cuda import skip_unless_mamba_cuda
 
 
 class EmaTests(unittest.TestCase):
@@ -62,17 +73,33 @@ class MetricTests(unittest.TestCase):
         self.assertIn("f1_or_dsc:", log)
 
 
+def _cuda_loader(loader):
+    class _Loader:
+        def __len__(self):
+            return len(loader)
+
+        def __iter__(self):
+            for batch in loader:
+                if torch.is_tensor(batch):
+                    yield batch.cuda()
+                else:
+                    yield type(batch)(item.cuda() if torch.is_tensor(item) else item for item in batch)
+
+    return _Loader()
+
+
+@skip_unless_mamba_cuda
 class SmokeTests(unittest.TestCase):
-    def test_two_cpu_steps_log_unsup_loss_and_keep_fraction(self):
-        labeled, unlabeled = build_ssl_datasets(length=4, size=16, seed=1)
+    def test_two_cuda_steps_log_unsup_loss_and_keep_fraction(self):
+        labeled, unlabeled = build_ssl_datasets(length=4, size=32, seed=1)
         labeled_loader, unlabeled_loader = build_dual_loaders(labeled, unlabeled, batch_size=2)
-        val_labeled, _ = build_ssl_datasets(length=4, size=16, seed=2)
+        val_labeled, _ = build_ssl_datasets(length=4, size=32, seed=2)
         val_loader, _ = build_dual_loaders(val_labeled, val_labeled, batch_size=2)
         result = run_ssl_loop(
-            TinySegStudent(),
-            labeled_loader,
-            unlabeled_loader,
-            val_loader,
+            build_mamba_student().cuda(),
+            _cuda_loader(labeled_loader),
+            _cuda_loader(unlabeled_loader),
+            _cuda_loader(val_loader),
             steps=2,
             gate=GateConfig(mode="soft", level="both"),
             lambda_max=1.0,
@@ -96,11 +123,14 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("hd95:", format_eval_log(metrics))
 
     def test_single_step_backward_is_finite(self):
-        labeled, unlabeled = build_ssl_datasets(length=2, size=16, seed=3)
+        labeled, unlabeled = build_ssl_datasets(length=2, size=32, seed=3)
         labeled_loader, unlabeled_loader = build_dual_loaders(labeled, unlabeled, batch_size=2)
         images_l, masks_l, images_u = next(iter(iter_batches(labeled_loader, unlabeled_loader)))
-        student = TinySegStudent()
-        teacher = TinySegStudent()
+        images_l = images_l.cuda()
+        masks_l = masks_l.cuda()
+        images_u = images_u.cuda()
+        student = build_mamba_student().cuda()
+        teacher = build_mamba_student().cuda().eval()
         for param in teacher.parameters():
             param.requires_grad_(False)
         optimizer = torch.optim.AdamW(student.parameters(), lr=1e-3)
@@ -122,12 +152,12 @@ class SmokeTests(unittest.TestCase):
         self.assertGreater(row["lambda_u"], 0.0)
         self.assertLess(row["lambda_u"], 0.1)
 
-    def test_evaluate_loader_runs_on_cpu(self):
-        labeled, _ = build_ssl_datasets(length=2, size=16, seed=4)
+    def test_evaluate_loader_runs_on_cuda(self):
+        labeled, _ = build_ssl_datasets(length=2, size=32, seed=4)
         loader, _ = build_dual_loaders(labeled, labeled, batch_size=2)
         from utils import BceDiceLoss
 
-        metrics = evaluate_loader(TinySegStudent(), loader, BceDiceLoss())
+        metrics = evaluate_loader(build_mamba_student().cuda(), _cuda_loader(loader), BceDiceLoss())
         self.assertIn("hd95", metrics)
         self.assertTrue(torch.isfinite(torch.tensor(metrics["f1_or_dsc"])))
 

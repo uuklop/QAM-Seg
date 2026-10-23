@@ -1,5 +1,6 @@
 """MambaLiteUNet is the only SSL student. The real class is optional in CI."""
 
+import contextlib
 import io
 import subprocess
 import sys
@@ -32,6 +33,33 @@ class _FakeMamba(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class _CpuDeviceLoader:
+    """Stand-in so a reported CUDA device keeps batches on CPU in unit tests."""
+
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        yield from self.loader
+
+
+@contextlib.contextmanager
+def _cuda_reported_without_a_gpu():
+    """Treat CUDA as available and keep the fake student on CPU."""
+
+    def _stay_on_cpu(self, *args, **kwargs):
+        return self
+
+    with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
+        "torch.nn.Module.cuda", _stay_on_cpu
+    ), mock.patch("qamseg.train_ssl._DeviceLoader", _CpuDeviceLoader):
+        yield
 
 
 class BackboneTests(unittest.TestCase):
@@ -94,11 +122,36 @@ class BackboneTests(unittest.TestCase):
 
     def test_requested_mamba_uses_the_imported_class(self):
         _FakeMamba.built = 0
+        args, _unknown, _reserved = parse_train_args(
+            [
+                "--ssl",
+                "--ssl-backbone",
+                "mamba",
+                "--ssl-device",
+                "cuda",
+                "--ssl-steps",
+                "1",
+                "--ssl-image-size",
+                "32",
+                "--ssl-batch-size",
+                "2",
+            ]
+        )
+        buffer = io.StringIO()
+        with _cuda_reported_without_a_gpu(), mock.patch(
+            "qamseg.backbones.import_mamba_lite_unet", return_value=_FakeMamba
+        ), redirect_stdout(buffer):
+            code = run_from_args(args)
+        text = buffer.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("Student: MambaLiteUNet", text)
+        self.assertNotIn("TinySegStudent", text)
+        self.assertIn("gate_keep_fraction:", text)
+        self.assertGreaterEqual(_FakeMamba.built, 1)
         student = build_mamba_student(importer=lambda: _FakeMamba)
         self.assertIsInstance(student, _FakeMamba)
         self.assertEqual(student.c_list, [16, 32, 48, 64, 96, 128])
         self.assertEqual(tuple(student(torch.zeros(1, 3, 8, 8)).shape), (1, 1, 8, 8))
-        self.assertGreaterEqual(_FakeMamba.built, 1)
 
     def test_import_failure_exits_without_a_substitute(self):
         def explode():
